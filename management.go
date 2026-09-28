@@ -132,30 +132,48 @@ func hostAuthList() ([]pluginapi.HostAuthFileEntry, error) {
 	return resp.Files, nil
 }
 
-// managementAccounts lists all imported cursor accounts.
+// managementAccounts lists all imported cursor accounts. host.auth.list hides
+// file credentials without a path attribute, so the panel scans the auth
+// directory directly (the plugin runs inside the service process).
 func managementAccounts() ([]byte, error) {
-	entries, err := hostAuthList()
+	dir := filepath.Join(cwdOrRoot(), "auths")
+	matches, err := filepath.Glob(filepath.Join(dir, providerKey+"-*.json"))
 	if err != nil {
 		return jsonResponse(http.StatusOK, map[string]any{"accounts": []any{}, "error": err.Error()})
 	}
-	accounts := make([]map[string]any, 0)
-	for _, entry := range entries {
-		if !isCursorAuthEntry(entry) {
+	accounts := make([]map[string]any, 0, len(matches))
+	for _, path := range matches {
+		name := filepath.Base(path)
+		raw, errRead := os.ReadFile(path)
+		if errRead != nil {
 			continue
 		}
-		label := entry.Label
+		cred, errParse := parseCursorCredential(raw)
+		if errParse != nil || cred.AccessToken == "" {
+			continue
+		}
+		label := cred.Label
 		if label == "" {
-			label = entry.Email
+			label = cred.Email
 		}
 		if label == "" {
-			label = entry.Name
+			label = name
+		}
+		mod := ""
+		if info, errInfo := os.Stat(path); errInfo == nil {
+			mod = info.ModTime().Format("2006-01-02 15:04")
+		}
+		masked := cred.AccessToken
+		if len(masked) > 14 {
+			masked = masked[:10] + "…" + masked[len(masked)-4:]
 		}
 		accounts = append(accounts, map[string]any{
-			"name":        entry.Name,
-			"label":       label,
-			"status":      entry.Status,
-			"disabled":    entry.Disabled,
-			"unavailable": entry.Unavailable,
+			"name":    name,
+			"label":   label,
+			"email":   cred.Email,
+			"token":   masked,
+			"machine": cred.MachineID,
+			"updated": mod,
 		})
 	}
 	return jsonResponse(http.StatusOK, map[string]any{"accounts": accounts})

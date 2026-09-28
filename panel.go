@@ -281,8 +281,7 @@ details.raw pre { overflow: auto; font-size: 12px; background: var(--bg-primary)
   function badge(entry) {
     if (entry.disabled) return '<span class="badge warn">已禁用</span>';
     if (entry.unavailable) return '<span class="badge warn">不可用</span>';
-    if (entry.status === "active" || entry.status === "valid" || !entry.status) return '<span class="badge ok">正常</span>';
-    return '<span class="badge">' + escapeHTML(entry.status) + "</span>";
+    return '<span class="badge ok">已导入</span>';
   }
 
   function loadAccounts() {
@@ -300,10 +299,12 @@ details.raw pre { overflow: auto; font-size: 12px; background: var(--bg-primary)
         return;
       }
       host.innerHTML = accounts.map(function (entry) {
+        var sub = entry.name + (entry.machine ? " · machine " + escapeHTML(entry.machine.slice(0, 8) + "…") : "");
         return '<div class="account-row">' +
           '<div class="account-meta">' +
             '<div class="account-name">' + escapeHTML(entry.label) + " " + badge(entry) + "</div>" +
-            '<div class="account-sub">' + escapeHTML(entry.name) + "</div>" +
+            '<div class="account-sub mono">' + escapeHTML(sub) + "</div>" +
+            '<div class="account-sub">' + escapeHTML(entry.token || "") + (entry.updated ? " · 更新于 " + escapeHTML(entry.updated) : "") + "</div>" +
           "</div>" +
           '<div class="account-actions">' +
             '<button type="button" data-auth="' + escapeHTML(entry.name) + '" data-act="models">查看模型</button>' +
