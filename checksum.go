@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"os"
 	"runtime"
 	"strings"
 	"time"
@@ -138,6 +139,27 @@ func localTimezone() string {
 	return name
 }
 
+// Environment overrides let operators pin a newer Cursor client build without
+// rebuilding the plugin (env on the cli-proxy-api unit).
+var (
+	cursorClientVersionOverride = os.Getenv("CURSOR_CLIENT_VERSION")
+	cursorClientCommitOverride  = os.Getenv("CURSOR_CLIENT_COMMIT")
+)
+
+func effectiveClientVersion() string {
+	if cursorClientVersionOverride != "" {
+		return cursorClientVersionOverride
+	}
+	return cursorClientVersion
+}
+
+func effectiveClientCommit() string {
+	if cursorClientCommitOverride != "" {
+		return cursorClientCommitOverride
+	}
+	return cursorClientCommit
+}
+
 // buildCursorHeaders assembles the header set every Cursor upstream call
 // needs. The endpoint is not part of the checksum, so one builder serves both
 // the ChatService and the AgentService.
@@ -158,8 +180,8 @@ func buildCursorHeaders(id cursorIdentity) map[string]string {
 		"x-amzn-trace-id":             "Root=" + randomUUID(),
 		"x-client-key":                generateHashed64Hex(token, ""),
 		"x-cursor-checksum":           generateCursorChecksum(machineID),
-		"x-cursor-client-version":     cursorClientVersion,
-		"x-cursor-client-commit":      cursorClientCommit,
+		"x-cursor-client-version":     effectiveClientVersion(),
+		"x-cursor-client-commit":      effectiveClientCommit(),
 		"x-cursor-client-type":        "ide",
 		"x-cursor-client-os":          clientOS(),
 		"x-cursor-client-arch":        clientArch(),

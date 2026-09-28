@@ -17,20 +17,34 @@ import (
 // staticCursorModels mirrors 9router's providerModels cursor row. Context and
 // thinking metadata follows what the catalog there declares.
 var staticCursorModels = []pluginapi.ModelInfo{
-	{ID: "auto", Name: "auto", Description: "Cursor Auto (pro / max only)"},
-	{ID: "claude-4.5-sonnet", Name: "claude-4.5-sonnet", Description: "Anthropic Claude 4.5 Sonnet (cursor-pro / max)"},
-	{ID: "claude-4.5-sonnet-thinking", Name: "claude-4.5-sonnet-thinking", Description: "Anthropic Claude 4.5 Sonnet with thinking (cursor-pro / max)"},
-	{ID: "claude-4.5-sonnet-max", Name: "claude-4.5-sonnet-max", Description: "Anthropic Claude 4.5 Sonnet Max (cursor-max)"},
-	{ID: "gpt-5.2", Name: "gpt-5.2", Description: "OpenAI GPT-5.2 (cursor-pro / max)"},
-	{ID: "gpt-5.2-high", Name: "gpt-5.2-high", Description: "OpenAI GPT-5.2 with high reasoning (cursor-pro / max)"},
-	{ID: "gpt-5.2-thinking", Name: "gpt-5.2-thinking", Description: "OpenAI GPT-5.2 Thinking (cursor-pro / max)"},
-	{ID: "gpt-5.2-codex", Name: "gpt-5.2-codex", Description: "OpenAI GPT-5.2 Codex (cursor-pro / max)"},
-	{ID: "gpt-5.2-codex-thinking", Name: "gpt-5.2-codex-thinking", Description: "OpenAI GPT-5.2 Codex Thinking (cursor-pro / max)"},
-	{ID: "gemini-3.8-pro", Name: "gemini-3.8-pro", Description: "Google Gemini 3.8 Pro (cursor-pro / max)"},
-	{ID: "gemini-3.8-flash", Name: "gemini-3.8-flash", Description: "Google Gemini 3.8 Flash (cursor-pro / max)"},
-	{ID: "composer-1", Name: "composer-1", Description: "Cursor Composer 1 (all plans)"},
-	{ID: "composer-1-thinking", Name: "composer-1-thinking", Description: "Cursor Composer 1 Thinking (all plans)"},
-	{ID: "auto-gpt-5.2", Name: "auto-gpt-5.2", Description: "Cursor Auto GPT-5.2 (cursor-pro / max)"},
+	{ID: "auto", Name: "auto", DisplayName: "Auto", Description: "Auto"},
+	{ID: "gpt-5.3-codex", Name: "gpt-5.3-codex", DisplayName: "Codex 5.3", Description: "Codex 5.3"},
+	{ID: "gpt-5.3-codex-fast", Name: "gpt-5.3-codex-fast", DisplayName: "Codex 5.3 Fast", Description: "Codex 5.3 Fast"},
+	{ID: "gpt-5.2", Name: "gpt-5.2", DisplayName: "GPT-5.2", Description: "GPT-5.2"},
+	{ID: "composer-2.5", Name: "composer-2.5", DisplayName: "Composer 2.5", Description: "Composer 2.5"},
+	{ID: "claude-opus-5-thinking-high", Name: "claude-opus-5-thinking-high", DisplayName: "Claude Opus 5 1M Thinking", Description: "Claude Opus 5 1M Thinking"},
+	{ID: "claude-opus-5-thinking-high-fast", Name: "claude-opus-5-thinking-high-fast", DisplayName: "Claude Opus 5 1M Thinking Fast", Description: "Claude Opus 5 1M Thinking Fast"},
+	{ID: "gpt-5.6-sol-high", Name: "gpt-5.6-sol-high", DisplayName: "GPT-5.6 Sol 1M High", Description: "GPT-5.6 Sol 1M High"},
+	{ID: "gpt-5.6-sol-high-fast", Name: "gpt-5.6-sol-high-fast", DisplayName: "GPT-5.6 Sol 1M High Fast", Description: "GPT-5.6 Sol 1M High Fast"},
+	{ID: "claude-fable-5-thinking-high", Name: "claude-fable-5-thinking-high", DisplayName: "Claude Fable 5 1M Thinking (NO ZDR)", Description: "Claude Fable 5 1M Thinking (NO ZDR)"},
+	{ID: "cursor-grok-4.5-high", Name: "cursor-grok-4.5-high", DisplayName: "Grok 4.5", Description: "Grok 4.5"},
+	{ID: "cursor-grok-4.5-high-fast", Name: "cursor-grok-4.5-high-fast", DisplayName: "Grok 4.5 Fast", Description: "Grok 4.5 Fast"},
+	{ID: "gemini-3.7-flash-high", Name: "gemini-3.7-flash-high", DisplayName: "Gemini 3.7 Flash", Description: "Gemini 3.7 Flash"},
+	{ID: "claude-sonnet-5-thinking-high", Name: "claude-sonnet-5-thinking-high", DisplayName: "Claude Sonnet 5 1M Thinking", Description: "Claude Sonnet 5 1M Thinking"},
+	{ID: "gpt-5.6-luna-high", Name: "gpt-5.6-luna-high", DisplayName: "GPT-5.6 Luna 1M High", Description: "GPT-5.6 Luna 1M High"},
+	{ID: "grok-4.7-high", Name: "grok-4.7-high", DisplayName: "Grok 4.7  High", Description: "Grok 4.7  High"},
+	{ID: "grok-4.7-high-fast", Name: "grok-4.7-high-fast", DisplayName: "", Description: "grok-4.7-high-fast"},
+	{ID: "cursor-grok-4.6-high", Name: "cursor-grok-4.6-high", DisplayName: "Grok 4.6", Description: "Grok 4.6"},
+	{ID: "cursor-grok-4.6-high-fast", Name: "cursor-grok-4.6-high-fast", DisplayName: "Grok 4.6 Fast", Description: "Grok 4.6 Fast"},
+	{ID: "composer-2.5-fast", Name: "composer-2.5-fast", DisplayName: "Composer 2.5 Fast", Description: "Composer 2.5 Fast"},
+	{ID: "claude-opus-5-5-medium", Name: "claude-opus-5-5-medium", DisplayName: "Claude Opus 5.5 1M", Description: "Claude Opus 5.5 1M"},
+	{ID: "claude-opus-5-5-medium-fast", Name: "claude-opus-5-5-medium-fast", DisplayName: "Claude Opus 5.5 1M Fast", Description: "Claude Opus 5.5 1M Fast"},
+	{ID: "claude-opus-5-5-high", Name: "claude-opus-5-5-high", DisplayName: "Claude Opus 5.5 1M High", Description: "Claude Opus 5.5 1M High"},
+	{ID: "claude-opus-5-5-high-fast", Name: "claude-opus-5-5-high-fast", DisplayName: "Claude Opus 5.5 1M High Fast", Description: "Claude Opus 5.5 1M High Fast"},
+	{ID: "gpt-5.2-fast", Name: "gpt-5.2-fast", DisplayName: "GPT-5.2 Fast", Description: "GPT-5.2 Fast"},
+	{ID: "gpt-5.6-luna-high-fast", Name: "gpt-5.6-luna-high-fast", DisplayName: "GPT-5.6 Luna 1M High Fast", Description: "GPT-5.6 Luna 1M High Fast"},
+	{ID: "kimi-k3-max", Name: "kimi-k3-max", DisplayName: "Kimi K3", Description: "Kimi K3"},
+	{ID: "glm-5.2-max", Name: "glm-5.2-max", DisplayName: "GLM 5.2 Max", Description: "GLM 5.2 Max"},
 }
 
 // applyCursorModelTiers fills the tier metadata CPA displays; done in code so
@@ -72,14 +86,15 @@ const cursorCatalogTTL = 10 * time.Minute
 
 // cursorUsableModel is one entry of the GetUsableModels response.
 type cursorUsableModel struct {
-	ID   string
-	Name string
+	ID      string
+	Name    string
+	Aliases []string
 }
 
-// parseUsableModels decodes the GetUsableModels protobuf: repeated field 1,
-// each entry {id: 1 string, name: 2 string, features: 3 message}. Mirrors
-// parseUsableModelsResponse with the official-id filtering removed (this
-// plugin trusts the account's own list).
+// parseUsableModels decodes the GetUsableModels protobuf as observed on
+// 2026-09-28: repeated field 1, each entry {slug: 1, id: 3, name: 4, aliases: 6*}.
+// (9router's older shape — nested list + name at 2 — no longer matches the
+// live response and yields empty ids.)
 func parseUsableModels(data []byte) []cursorUsableModel {
 	var out []cursorUsableModel
 	for _, field := range decodeMessage(data) {
@@ -88,11 +103,16 @@ func parseUsableModels(data []byte) []cursorUsableModel {
 		}
 		entry := decodeMessage(field.Value)
 		model := cursorUsableModel{}
-		if f, ok := fieldFirst(entry, 1); ok && f.IsLen {
+		if f, ok := fieldFirst(entry, 3); ok && f.IsLen {
 			model.ID = string(f.Value)
 		}
-		if f, ok := fieldFirst(entry, 2); ok && f.IsLen {
+		if f, ok := fieldFirst(entry, 4); ok && f.IsLen {
 			model.Name = string(f.Value)
+		}
+		for _, f := range entry {
+			if f.Number == 6 && f.IsLen {
+				model.Aliases = append(model.Aliases, string(f.Value))
+			}
 		}
 		if model.ID != "" {
 			out = append(out, model)
@@ -111,8 +131,8 @@ func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
 		return entry.models
 	}
 
-	models := append([]pluginapi.ModelInfo(nil), staticCursorModels...)
-	live := fetchLiveCatalog(identity)
+	models := filterByPolicy(append([]pluginapi.ModelInfo(nil), staticCursorModels...))
+	live := filterByPolicy(fetchLiveCatalog(identity))
 	if len(live) > 0 {
 		byID := map[string]pluginapi.ModelInfo{}
 		for _, m := range live {

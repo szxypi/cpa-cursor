@@ -14,11 +14,12 @@ import (
 
 // Resource paths exposed under /v0/resource/plugins/cpa-cursor/*.
 const (
-	panelPath    = "/panel"
-	accountsPath = "/accounts"
-	importPath   = "/import"
-	modelsPath   = "/models"
-	testPath     = "/test"
+	panelPath     = "/panel"
+	accountsPath  = "/accounts"
+	importPath    = "/import"
+	modelsPath    = "/models"
+	modelsSetPath = "/models/set"
+	testPath      = "/test"
 )
 
 func handleManagementRegister() ([]byte, error) {
@@ -30,6 +31,7 @@ func handleManagementRegister() ([]byte, error) {
 			{Path: accountsPath, Description: "列出已导入的 Cursor 账号"},
 			{Path: importPath, Description: "导入 Cursor access token 并保存凭证文件"},
 			{Path: modelsPath, Description: "查询指定 Cursor 账号的可用模型列表"},
+			{Path: modelsSetPath, Description: "设置选中的模型集合（ids=逗号分隔；reset=1 恢复全部启用）"},
 			{Path: testPath, Description: "对 Cursor 上游进行连通性测试"},
 		},
 	})
@@ -49,11 +51,30 @@ func handleManagementRequest(request []byte) ([]byte, error) {
 	case strings.HasSuffix(req.Path, accountsPath):
 		return managementAccounts()
 	case strings.HasSuffix(req.Path, importPath):
-		return managementImport(req.Body)
+		return managementImportQuery(req.Query.Get("token"), req.Query.Get("machine_id"), req.Query.Get("email"))
 	case strings.HasSuffix(req.Path, modelsPath):
-		return managementModels(req.Query.Get("auth"))
+		return managementModels(req.Query.Get("auth"), req.Query.Get("version"), req.Query.Get("client_type"))
 	case strings.HasSuffix(req.Path, testPath):
-		return managementTest(req.Query.Get("auth"))
+		return managementTest(req.Query.Get("auth"), req.Query.Get("version"), req.Query.Get("client_type"))
+
+	case strings.HasSuffix(req.Path, modelsSetPath):
+		if req.Query.Get("reset") == "1" {
+			if err := resetPolicy(); err != nil {
+				return errorEnvelope("policy_reset_failed", err.Error()), nil
+			}
+			return jsonResponse(http.StatusOK, map[string]any{"status": "success", "reset": true})
+		}
+		ids := strings.Split(req.Query.Get("ids"), ",")
+		cleaned := make([]string, 0, len(ids))
+		for _, id := range ids {
+			if id = strings.TrimSpace(id); id != "" {
+				cleaned = append(cleaned, id)
+			}
+		}
+		if err := savePolicySelection(cleaned); err != nil {
+			return errorEnvelope("policy_save_failed", err.Error()), nil
+		}
+		return jsonResponse(http.StatusOK, map[string]any{"status": "success", "selected": len(cleaned)})
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{"error": "unknown resource path"})
 	}
@@ -136,23 +157,15 @@ func managementAccounts() ([]byte, error) {
 	return jsonResponse(http.StatusOK, map[string]any{"accounts": accounts})
 }
 
-// importPayload is the POST body for /import.
-type importPayload struct {
-	Token     string `json:"token"`
-	MachineID string `json:"machine_id"`
-	Email     string `json:"email"`
-}
-
-func managementImport(body []byte) ([]byte, error) {
-	var payload importPayload
-	if err := json.Unmarshal(body, &payload); err != nil {
-		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "无效的 JSON 数据"})
-	}
-	token := strings.TrimSpace(payload.Token)
+// managementImportQuery handles GET /import?token=... — the host only
+// dispatches GET to plugin resource routes, and the iframe cannot reach the
+// management-authenticated POST channel, so import travels as a query.
+func managementImportQuery(token, machineID, email string) ([]byte, error) {
+	token = strings.TrimSpace(token)
 	if token == "" {
 		return jsonResponse(http.StatusBadRequest, map[string]any{"error": "AccessToken 不能为空"})
 	}
-	cred := newCursorCredential(token, strings.TrimSpace(payload.MachineID), strings.TrimSpace(payload.Email))
+	cred := newCursorCredential(token, strings.TrimSpace(machineID), strings.TrimSpace(email))
 	storage, err := json.MarshalIndent(cred, "", "  ")
 	if err != nil {
 		return jsonResponse(http.StatusInternalServerError, map[string]any{"error": err.Error()})
@@ -210,7 +223,7 @@ func accountCredential(authID string) (pluginapi.HostAuthFileEntry, *cursorCrede
 }
 
 // managementModels fetches the dynamic model catalog for an account.
-func managementModels(authName string) ([]byte, error) {
+func managementModels(authName, versionOverride, clientTypeOverride string) ([]byte, error) {
 	authName = strings.TrimSpace(authName)
 	if authName == "" {
 		return jsonResponse(http.StatusOK, map[string]any{
@@ -226,18 +239,32 @@ func managementModels(authName string) ([]byte, error) {
 			"error":  err.Error(),
 		})
 	}
-	models := catalogForToken(cred.identity())
+	infos := fetchModelsWithOverrides(cred, versionOverride, clientTypeOverride)
+	set := selectedModelSet()
+	rows := make([]map[string]any, 0, len(infos))
+	for _, m := range infos {
+		rows = append(rows, map[string]any{
+			"id":      m.ID,
+			"name":    m.DisplayName,
+			"aliases": m.Version,
+			"enabled": set == nil || set[m.ID],
+		})
+	}
 	return jsonResponse(http.StatusOK, map[string]any{
-		"models": models,
+		"models": rows,
 		"source": "dynamic",
-		"count":  len(models),
+		"count":  len(rows),
 		"auth":   entry.Name,
+		"probe":  probeLastError,
+		"mode":   map[bool]string{true: "explicit", false: "all"}[set != nil],
 	})
 }
 
 // managementTest probes Cursor upstream connectivity with the real token when
 // an account is named, otherwise an unauthenticated reachability probe.
-func managementTest(authName string) ([]byte, error) {
+// Optional version/client_type query params override the client headers for
+// one-shot comparisons (which model catalog a client build sees).
+func managementTest(authName, versionOverride, clientTypeOverride string) ([]byte, error) {
 	authName = strings.TrimSpace(authName)
 	identity := cursorIdentity{AccessToken: "probe", GhostMode: true}
 	authLabel := ""
@@ -251,6 +278,12 @@ func managementTest(authName string) ([]byte, error) {
 
 	start := time.Now()
 	headers := buildCursorHeaders(identity)
+	if versionOverride != "" {
+		headers["x-cursor-client-version"] = versionOverride
+	}
+	if clientTypeOverride != "" {
+		headers["x-cursor-client-type"] = clientTypeOverride
+	}
 	headers["Content-Type"] = "application/proto"
 	headers["User-Agent"] = "connectrpc/1.x-go"
 
@@ -278,4 +311,40 @@ func managementTest(authName string) ([]byte, error) {
 		"message": message,
 		"auth":    authLabel,
 	})
+}
+
+// probeLastError records the last raw probe outcome for panel diagnostics.
+var probeLastError string
+
+// fetchModelsWithOverrides queries GetUsableModels with optional one-shot
+// client header overrides (for comparing what different client builds see).
+func fetchModelsWithOverrides(cred *cursorCredential, versionOverride, clientTypeOverride string) []pluginapi.ModelInfo {
+	headers := buildCursorHeaders(cred.identity())
+	if versionOverride != "" {
+		headers["x-cursor-client-version"] = versionOverride
+	}
+	if clientTypeOverride != "" {
+		headers["x-cursor-client-type"] = clientTypeOverride
+	}
+	headers["Content-Type"] = "application/proto"
+	headers["User-Agent"] = "connectrpc/1.x-go"
+	delete(headers, "Connect-Accept-Encoding")
+	delete(headers, "Connect-Protocol-Version")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 8*time.Second)
+	defer cancel()
+	body, err := fetchUsableModels(ctx, cursorAgentBase+cursorModelsPath, headers)
+	probeLastError = fmt.Sprintf("%d bytes: %v", len(body), err)
+	if err != nil {
+		hostLog("warn", "models probe failed: "+err.Error())
+		return staticCursorModels
+	}
+	var out []pluginapi.ModelInfo
+	for _, m := range parseUsableModels(body) {
+		out = append(out, pluginapi.ModelInfo{ID: m.ID, Name: m.ID, DisplayName: m.Name, Version: strings.Join(m.Aliases, ", ")})
+	}
+	if len(out) == 0 {
+		return staticCursorModels
+	}
+	return out
 }

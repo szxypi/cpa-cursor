@@ -112,6 +112,9 @@ button.primary:hover { background: var(--primary-hover); }
 button:disabled { opacity: .55; cursor: not-allowed; }
 
 .actions { display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+.toolbar { display: flex; gap: 8px; align-items: center; margin-bottom: 10px; flex-wrap: wrap; }
+.toolbar .status { margin-left: 4px; }
+#toast { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%); background: var(--bg-elevated, #1f2430); color: var(--text-primary, #e6e9f0); border: 1px solid var(--border, #2a3040); border-radius: 8px; padding: 8px 14px; font-size: 13px; z-index: 50; box-shadow: 0 6px 24px rgba(0,0,0,.25); }
 
 .status { min-height: 20px; margin-top: 8px; font-size: 13px; color: var(--text-secondary); }
 .status.ok { color: var(--success-color); }
@@ -233,14 +236,6 @@ details.raw pre { overflow: auto; font-size: 12px; background: var(--bg-primary)
     return fetch(base + path).then(function (r) { return r.json(); });
   }
 
-  function postJSON(path, body) {
-    return fetch(base + path, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(body)
-    }).then(function (r) { return r.json(); });
-  }
-
   // ---- import ---------------------------------------------------------
 
   document.getElementById("import-form").addEventListener("submit", function (event) {
@@ -252,7 +247,10 @@ details.raw pre { overflow: auto; font-size: 12px; background: var(--bg-primary)
     var btn = document.getElementById("import-btn");
     btn.disabled = true;
     setStatus("import-status", "导入中…");
-    postJSON("/import", { token: token, machine_id: machineId, email: email }).then(function (resp) {
+    var qs = "?token=" + encodeURIComponent(token) +
+      "&machine_id=" + encodeURIComponent(machineId) +
+      "&email=" + encodeURIComponent(email);
+    getJSON("/import" + qs).then(function (resp) {
       if (resp.error) {
         setStatus("import-status", "导入失败：" + resp.error, "err");
       } else {
@@ -338,22 +336,75 @@ details.raw pre { overflow: auto; font-size: 12px; background: var(--bg-primary)
     body.innerHTML = '<div class="skeleton"><span></span><span></span><span></span></div>';
     getJSON("/models?auth=" + encodeURIComponent(auth)).then(function (resp) {
       var models = resp.models || [];
+      window.__cursorModels = models;
       var rows = models.map(function (m) {
+        var id = m.id || m.ID;
         return "<tr>" +
-          '<td class="mono">' + escapeHTML(m.id || m.ID) + "</td>" +
-          "<td>" + escapeHTML(m.display_name || m.DisplayName || "") + "</td>" +
-          '<td style="color:var(--text-tertiary)">' + escapeHTML(m.description || m.Description || "") + "</td>" +
+          '<td><input type="checkbox" class="model-check" data-id="' + escapeHTML(id) + '"' + (m.enabled ? " checked" : "") + "></td>" +
+          '<td class="mono">' + escapeHTML(id) + "</td>" +
+          "<td>" + escapeHTML(m.name || m.display_name || m.DisplayName || "") + "</td>" +
+          '<td style="color:var(--text-tertiary)">' + escapeHTML(m.aliases || "") + "</td>" +
         "</tr>";
       });
+      var toolbar =
+        '<div class="toolbar">' +
+          '<button type="button" id="btn-check-all">全选</button>' +
+          '<button type="button" id="btn-check-none">取消全选</button>' +
+          '<button type="button" id="btn-save-selection" class="primary">保存选择</button>' +
+          '<button type="button" id="btn-reset-selection">恢复全部</button>' +
+          '<span class="status" id="selection-status"></span>' +
+        "</div>";
       body.innerHTML = rows.length
-        ? '<table class="models-table"><tr><th>模型 ID</th><th>名称</th><th>说明</th></tr>' + rows.join("") + "</table>" +
-          '<div class="status">共 ' + rows.length + " 个模型（来源：" + escapeHTML(resp.source || "static") + "）" + (resp.error ? " · " + escapeHTML(resp.error) : "") + "</div>"
+        ? toolbar + '<table class="models-table"><tr><th></th><th>模型 ID</th><th>名称</th><th>别名</th></tr>' + rows.join("") + "</table>" +
+          '<div class="status">共 ' + rows.length + " 个模型（来源：" + escapeHTML(resp.source || "static") + "；选择模式：" + escapeHTML(resp.mode || "all") + "）</div>"
         : '<div class="empty">该账号没有返回任何模型</div>';
+      function checkedIds() {
+        return Array.prototype.filter.call(document.querySelectorAll(".model-check"), function (c) { return c.checked; })
+          .map(function (c) { return c.getAttribute("data-id"); });
+      }
+      function updateCount() {
+        document.getElementById("selection-status").textContent = "已选 " + checkedIds().length + " / " + models.length;
+      }
+      document.getElementById("btn-check-all").onclick = function () {
+        Array.prototype.forEach.call(document.querySelectorAll(".model-check"), function (c) { c.checked = true; });
+        updateCount();
+      };
+      document.getElementById("btn-check-none").onclick = function () {
+        Array.prototype.forEach.call(document.querySelectorAll(".model-check"), function (c) { c.checked = false; });
+        updateCount();
+      };
+      document.getElementById("btn-save-selection").onclick = function () {
+        var btn = this;
+        btn.disabled = true;
+        getJSON("/models/set?ids=" + encodeURIComponent(checkedIds().join(","))).then(function (resp2) {
+          btn.disabled = false;
+          updateCount();
+          toast(resp2.status === "success" ? "已保存：选中的模型才会出现在 /v1/models" : "保存失败");
+        }).catch(function () { btn.disabled = false; toast("保存失败"); });
+      };
+      document.getElementById("btn-reset-selection").onclick = function () {
+        getJSON("/models/set?reset=1").then(function () {
+          showModels(selected);
+          toast("已恢复全部启用");
+        }).catch(function () { toast("恢复失败"); });
+      };
+      Array.prototype.forEach.call(document.querySelectorAll(".model-check"), function (c) { c.onchange = updateCount; });
+      updateCount();
       document.getElementById("models-raw-pre").textContent = JSON.stringify(resp, null, 2);
       document.getElementById("models-raw").hidden = false;
     }).catch(function (err) {
       body.innerHTML = '<div class="empty">加载失败：' + escapeHTML(String(err)) + "</div>";
     });
+  }
+
+  var toastTimer = null;
+  function toast(message) {
+    var el = document.getElementById("toast");
+    if (!el) { el = document.createElement("div"); el.id = "toast"; document.body.appendChild(el); }
+    el.textContent = message;
+    el.hidden = false;
+    if (toastTimer) clearTimeout(toastTimer);
+    toastTimer = setTimeout(function () { el.hidden = true; }, 2600);
   }
 
   function runTest(auth, btn) {
