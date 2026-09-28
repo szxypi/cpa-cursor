@@ -67,9 +67,10 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:    pluginName,
-			Version: pluginVersion,
-			Author:  "szxypi",
+			Name:            pluginName,
+			Version:         pluginVersion,
+			Author:          "szxypi",
+			GitHubRepository: "szxypi/cpa-cursor",
 			ConfigFields: []pluginapi.ConfigField{
 				{
 					Name:        "enabled",
