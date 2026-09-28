@@ -1,0 +1,74 @@
+#!/usr/bin/env bash
+# Install a built cpa-cursor library next to CPA and restart the service.
+# Usage: sudo ops/deploy [version]   (default: the version in main.go)
+set -Eeuo pipefail
+
+PLUGIN_ID="cpa-cursor"
+PLUGIN_DIR="/var/lib/cli-proxy-api/plugins/linux/amd64"
+SERVICE="cli-proxy-api.service"
+SOURCE_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+log() { printf '[%s] %s\n' "${PLUGIN_ID}" "$*"; }
+
+VERSION="${1:-}"
+if [[ -z "${VERSION}" ]]; then
+  VERSION="$(sed -n 's/.*pluginVersion *= *"\(.*\)".*/\1/p' "${SOURCE_DIR}/main.go" | head -n1)"
+fi
+[[ -n "${VERSION}" ]] || { log "could not determine the plugin version"; exit 1; }
+
+# CPA derives the plugin id from the artifact file name, not from metadata.Name.
+ARTIFACT="${SOURCE_DIR}/dist/${PLUGIN_ID}-v${VERSION}.so"
+[[ -f "${ARTIFACT}" ]] || { log "missing build artifact: ${ARTIFACT}"; exit 1; }
+
+CHECKSUM_FILE="${ARTIFACT}.sha256"
+if [[ -f "${CHECKSUM_FILE}" ]]; then
+  # Compare hashes directly; the recorded file may carry any path prefix.
+  RECORDED="$(awk 'NR==1 {print $1}' "${CHECKSUM_FILE}")"
+  ACTUAL="$(sha256sum "${ARTIFACT}" | awk '{print $1}')"
+  [[ -n "${RECORDED}" && "${RECORDED}" == "${ACTUAL}" ]] \
+    || { log "checksum mismatch for ${ARTIFACT}"; exit 1; }
+fi
+
+[[ "$(id -u)" -eq 0 ]] || { log "run this with sudo"; exit 1; }
+
+# The library must be readable by the cliproxy service user but not writable by it.
+install -o root -g cliproxy -m 0550 "${ARTIFACT}" "${PLUGIN_DIR}/${PLUGIN_ID}-v${VERSION}.so"
+log "installed ${PLUGIN_DIR}/${PLUGIN_ID}-v${VERSION}.so"
+
+# Leaving older versions behind makes plugin selection ambiguous.
+for stale in "${PLUGIN_DIR}/${PLUGIN_ID}-v"*.so; do
+  [[ -e "${stale}" ]] || continue
+  if [[ "$(basename "${stale}")" != "${PLUGIN_ID}-v${VERSION}.so" ]]; then
+    rm -f "${stale}"
+    log "removed stale $(basename "${stale}")"
+  fi
+done
+
+# Restarting under traffic is what triggered the shutdown-time SIGSEGV in
+# September, so go through the drain script when it is available.
+if [[ -x /usr/local/sbin/cli-proxy-api-restart ]]; then
+  /usr/local/sbin/cli-proxy-api-restart 90
+else
+  systemctl restart "${SERVICE}"
+fi
+sleep 5
+systemctl is-active --quiet "${SERVICE}" || { log "${SERVICE} did not come back up"; exit 1; }
+
+# journald can lag a second or two behind the restart, so poll rather than
+# reading the log once. Capture the log first: `journalctl | grep -q` dies of
+# SIGPIPE once grep matches, and `set -o pipefail` would read that as a failure.
+REGISTERED=0
+for _ in $(seq 1 10); do
+  LOG="$(journalctl -u "${SERVICE}" --since "2 minutes ago" --no-pager)"
+  if grep -q "plugin registered plugin_id=${PLUGIN_ID} .*version=${VERSION}" <<<"${LOG}"; then
+    REGISTERED=1
+    break
+  fi
+  sleep 1
+done
+if [[ "${REGISTERED}" -eq 1 ]]; then
+  log "registered v${VERSION}"
+else
+  log "service is up but v${VERSION} was not registered; check journalctl -u ${SERVICE}"
+  exit 1
+fi
