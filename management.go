@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -62,7 +64,8 @@ func handleManagementRequest(request []byte) ([]byte, error) {
 			if err := resetPolicy(); err != nil {
 				return errorEnvelope("policy_reset_failed", err.Error()), nil
 			}
-			return jsonResponse(http.StatusOK, map[string]any{"status": "success", "reset": true})
+			rewritten := rewriteCursorAuths()
+			return jsonResponse(http.StatusOK, map[string]any{"status": "success", "reset": true, "refreshed": rewritten})
 		}
 		ids := strings.Split(req.Query.Get("ids"), ",")
 		cleaned := make([]string, 0, len(ids))
@@ -74,7 +77,8 @@ func handleManagementRequest(request []byte) ([]byte, error) {
 		if err := savePolicySelection(cleaned); err != nil {
 			return errorEnvelope("policy_save_failed", err.Error()), nil
 		}
-		return jsonResponse(http.StatusOK, map[string]any{"status": "success", "selected": len(cleaned)})
+		rewritten := rewriteCursorAuths()
+		return jsonResponse(http.StatusOK, map[string]any{"status": "success", "selected": len(cleaned), "refreshed": rewritten})
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{"error": "unknown resource path"})
 	}
@@ -311,6 +315,45 @@ func managementTest(authName, versionOverride, clientTypeOverride string) ([]byt
 		"message": message,
 		"auth":    authLabel,
 	})
+}
+
+// rewriteCursorAuths rewrites every cursor credential file unchanged so the
+// host watcher reloads them and re-pulls model.for_auth — RegisterClient has
+// replace semantics, so the shrunken selection takes effect immediately.
+// host.auth.list hides file entries without a path attribute, so this walks
+// the auth directory directly (the plugin runs inside the service process).
+func rewriteCursorAuths() int {
+	dir := filepath.Join(cwdOrRoot(), "auths")
+	matches, err := filepath.Glob(filepath.Join(dir, providerKey+"-*.json"))
+	if err != nil || len(matches) == 0 {
+		hostLog("warn", fmt.Sprintf("rewrite found no cursor auths in %s: %v", dir, err))
+		return 0
+	}
+	count := 0
+	for _, path := range matches {
+		raw, errRead := os.ReadFile(path)
+		if errRead != nil {
+			hostLog("warn", "rewrite read failed "+path+": "+errRead.Error())
+			continue
+		}
+		if _, err := parseCursorCredential(raw); err != nil {
+			continue
+		}
+		if err := os.WriteFile(path, raw, 0o600); err != nil {
+			hostLog("warn", "rewrite write failed "+path+": "+err.Error())
+			continue
+		}
+		count++
+	}
+	hostLog("info", fmt.Sprintf("rewrite done: %d auth files", count))
+	return count
+}
+
+func cwdOrRoot() string {
+	if cwd, err := os.Getwd(); err == nil && cwd != "" {
+		return cwd
+	}
+	return "/"
 }
 
 // probeLastError records the last raw probe outcome for panel diagnostics.
