@@ -27,6 +27,18 @@ type cursorCredential struct {
 	GhostMode   *bool  `json:"ghost_mode,omitempty"`
 }
 
+// newCursorCredential builds an imported credential; ghost mode defaults on
+// (9router's providerSpecificData.ghostMode !== false).
+func newCursorCredential(token, machineID, email string) cursorCredential {
+	ghost := true
+	return cursorCredential{
+		AccessToken: token,
+		MachineID:   machineID,
+		Email:       email,
+		GhostMode:   &ghost,
+	}
+}
+
 // parseCursorCredential decodes the storage JSON of a cursor auth file.
 func parseCursorCredential(storage []byte) (*cursorCredential, error) {
 	if len(strings.TrimSpace(string(storage))) == 0 {

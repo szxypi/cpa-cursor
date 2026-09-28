@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginName    = "cpa-cursor"
-	pluginVersion = "0.1.0"
+	pluginVersion = "0.2.0"
 	providerKey   = "cursor"
 	logPrefix     = "[cpa-cursor] "
 )
@@ -61,6 +61,7 @@ type registrationCapability struct {
 	ExecutorInputFormats  []string                     `json:"executor_input_formats,omitempty"`
 	ExecutorOutputFormats []string                     `json:"executor_output_formats,omitempty"`
 	CommandLinePlugin     bool                         `json:"command_line_plugin"`
+	ManagementAPI         bool                         `json:"management_api"`
 }
 
 func pluginRegistration() registration {
@@ -90,6 +91,7 @@ func pluginRegistration() registration {
 			ExecutorInputFormats:  []string{"openai"},
 			ExecutorOutputFormats: []string{"openai"},
 			CommandLinePlugin:     true,
+			ManagementAPI:         true,
 		},
 	}
 }
@@ -124,6 +126,11 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleCommandLineRegister(request)
 	case pluginabi.MethodCommandLineExecute:
 		return handleCommandLineExecute(request)
+
+	case pluginabi.MethodManagementRegister:
+		return handleManagementRegister()
+	case pluginabi.MethodManagementHandle:
+		return handleManagementRequest(request)
 
 	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
 		return okEnvelope(map[string]any{})
