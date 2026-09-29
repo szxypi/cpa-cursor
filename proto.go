@@ -463,7 +463,7 @@ func decodeMessage(data []byte) []pbField {
 			fields = append(fields, pbField{Number: number, Varint: value})
 		case wireLen:
 			length, next, ok := readVarint(data, pos)
-			if !ok || pos+int(length) > len(data) {
+			if !ok || length > uint64(len(data)-next) {
 				return fields
 			}
 			pos = next
@@ -675,14 +675,10 @@ func encodeHistoryMessage(content string, role string) []byte {
 
 // buildAgentRunFrame mirrors buildAgentRunFrame: the agent.v1 run_request
 // client message carrying the current user turn plus optional history.
-func buildAgentRunFrame(messages []cursorMessage, model string) []byte {
-	var systemParts []string
+func buildAgentRunFrame(messages []cursorMessage, model string, contexts ...*agentContext) []byte {
 	var chat []cursorMessage
 	for _, m := range messages {
 		if m.Role == "system" {
-			if m.Content != "" {
-				systemParts = append(systemParts, m.Content)
-			}
 			continue
 		}
 		chat = append(chat, m)
@@ -722,7 +718,7 @@ func buildAgentRunFrame(messages []cursorMessage, model string) []byte {
 		agentString(2, uuidFactory()),
 	)
 	var userAction []byte
-	if len(history) > 0 {
+	if len(history) > 0 && (len(contexts) == 0 || contexts[0] == nil) {
 		var historyFields []byte
 		for _, entry := range history {
 			historyFields = concat(historyFields, fieldBytes(1, entry))
@@ -733,12 +729,16 @@ func buildAgentRunFrame(messages []cursorMessage, model string) []byte {
 	}
 	conversationAction := fieldBytes(1, userAction)
 	requestedModel := concat(agentString(1, model), agentBool(7, true))
+	var state []byte
+	if len(contexts) > 0 && contexts[0] != nil {
+		state = contexts[0].state
+	}
 	runRequest := concat(
-		fieldBytes(1, nil),
+		fieldBytes(1, state),
 		fieldBytes(2, conversationAction),
 	)
-	if system := joinNonEmpty(systemParts, "\n\n"); system != "" {
-		runRequest = concat(runRequest, agentString(8, system))
+	if len(contexts) > 0 && contexts[0] != nil {
+		runRequest = concat(runRequest, fieldString(5, uuidFactory()))
 	}
 	runRequest = concat(runRequest, fieldBytes(9, requestedModel))
 	return wrapConnectFrame(fieldBytes(1, runRequest))

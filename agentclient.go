@@ -13,26 +13,38 @@ package main
 import (
 	"bufio"
 	"bytes"
+	"compress/gzip"
 	"context"
 	"fmt"
 	"io"
 	"net/http"
+	"sync"
 	"time"
 )
 
 // agentClient wraps one duplex AgentService run.
 type agentClient struct {
-	client *http.Client
-	pr     *io.PipeReader
-	pw     *io.PipeWriter
-	resp   *http.Response
-	cancel context.CancelFunc
+	client         *http.Client
+	pr             *io.PipeReader
+	pw             *io.PipeWriter
+	resp           *http.Response
+	cancel         context.CancelFunc
+	context        *agentContext
+	onTool         func(*agentToolRequest) error
+	writeMu        sync.Mutex
+	toolRejections int
 }
 
 // openAgentStream starts a POST whose body stays open for mid-flight writes.
 func openAgentStream(ctx context.Context, url string, headers map[string]string) (*agentClient, int, error) {
 	pr, pw := io.Pipe()
 	requestCtx, cancel := context.WithCancel(ctx)
+	// 双向请求的 io.Pipe 在上下文取消时必须主动关闭，否则 h2 写协程
+	// 仍等待下一帧，响应读取也可能无法结束。
+	context.AfterFunc(requestCtx, func() {
+		pr.CloseWithError(requestCtx.Err())
+		pw.CloseWithError(requestCtx.Err())
+	})
 	req, err := http.NewRequestWithContext(requestCtx, http.MethodPost, url, pr)
 	if err != nil {
 		cancel()
@@ -76,27 +88,43 @@ func openAgentStream(ctx context.Context, url string, headers map[string]string)
 
 // write sends another client frame on the run stream.
 func (a *agentClient) write(frame []byte) error {
+	a.writeMu.Lock()
+	defer a.writeMu.Unlock()
 	_, err := a.pw.Write(frame)
 	return err
 }
 
 // close terminates the stream and the connection.
 func (a *agentClient) close() {
-	a.cancel()
-	a.pr.CloseWithError(io.EOF)
-	a.pw.CloseWithError(io.EOF)
+	if a == nil {
+		return
+	}
+	if a.cancel != nil {
+		a.cancel()
+	}
+	if a.pr != nil {
+		a.pr.CloseWithError(io.EOF)
+	}
+	if a.pw != nil {
+		a.pw.CloseWithError(io.EOF)
+	}
 	if a.resp != nil {
 		a.resp.Body.Close()
 	}
-	if tr, ok := a.client.Transport.(*http.Transport); ok {
-		tr.CloseIdleConnections()
+	if a.client != nil {
+		if tr, ok := a.client.Transport.(*http.Transport); ok {
+			tr.CloseIdleConnections()
+		}
 	}
 }
 
 // agentRunResult is what runAgentTurn reports back to the executor.
 type agentRunResult struct {
-	Text     string
-	Finished bool
+	Text        string
+	Finished    bool
+	Ended       bool
+	Trace       agentTrace
+	TrailerCode string
 	// Fatal is a protocol-level failure: it must surface as an error, not as
 	// assistant text.
 	Fatal string
@@ -105,32 +133,42 @@ type agentRunResult struct {
 // runAgentTurn drives one AgentService run: sends the run frame, answers the
 // RequestContext handshake, and streams text deltas to onDelta until the turn
 // finishes. Remaining server frames after finish are drained but ignored.
-func (a *agentClient) runTurn(runFrame []byte, onDelta func(string)) agentRunResult {
+func (a *agentClient) runTurn(runFrame []byte, onDelta func(string) error, diagnostic bool) agentRunResult {
+	result := agentRunResult{Trace: agentTrace{Enabled: diagnostic}}
 	if err := a.write(runFrame); err != nil {
-		return agentRunResult{Fatal: fmt.Sprintf("cursor AgentService write failed: %v", err)}
+		result.Fatal = fmt.Sprintf("cursor AgentService write failed: %v", err)
+		return result
 	}
 
 	reader := bufio.NewReader(a.resp.Body)
 	var pending []byte
-	result := agentRunResult{}
 
-	for !result.Finished && result.Fatal == "" {
+	requestClosed := false
+	for !result.Ended && result.Fatal == "" {
 		chunk := make([]byte, 32*1024)
 		n, err := reader.Read(chunk)
 		if n > 0 {
 			pending = append(pending, chunk[:n]...)
 			pending = a.consumeAgentFrames(pending, &result, onDelta)
 		}
+		if result.Finished && !requestClosed {
+			// 完成事件不等于 RPC 成功；半关闭请求后读取最终 trailer。
+			a.pw.Close()
+			requestClosed = true
+		}
 		if err != nil {
 			if err == io.EOF {
+				result.Trace.EOF = true
 				break
 			}
-			if result.Finished {
-				break
-			}
+			result.Trace.ReadError = true
 			result.Fatal = fmt.Sprintf("cursor AgentService read failed: %v", err)
 			break
 		}
+	}
+	if diagnostic {
+		observeBufferedAgentTrailers(pending, &result.Trace)
+		result.Trace.Pending = len(pending) > 0
 	}
 	// Half-close so the server sees a clean end even if we stop early.
 	a.pw.CloseWithError(io.EOF)
@@ -142,7 +180,25 @@ func (a *agentClient) runTurn(runFrame []byte, onDelta func(string)) agentRunRes
 
 // consumeAgentFrames parses every complete frame in pending and returns the
 // remainder.
-func (a *agentClient) consumeAgentFrames(pending []byte, result *agentRunResult, onDelta func(string)) []byte {
+func decodeAgentTrailerCode(payload []byte, flags byte) string {
+	if flags&1 != 0 {
+		reader, err := gzip.NewReader(bytes.NewReader(payload))
+		if err != nil {
+			return "malformed"
+		}
+		defer reader.Close()
+		payload, err = io.ReadAll(io.LimitReader(reader, 65537))
+		if err != nil {
+			return "malformed"
+		}
+	}
+	if len(payload) > 65536 {
+		return "oversized"
+	}
+	return parseAgentTrailerCode(payload)
+}
+
+func (a *agentClient) consumeAgentFrames(pending []byte, result *agentRunResult, onDelta func(string) error) []byte {
 	for len(pending) >= 5 {
 		flags := pending[0]
 		length := int(uint32(pending[1])<<24 | uint32(pending[2])<<16 | uint32(pending[3])<<8 | uint32(pending[4]))
@@ -151,45 +207,138 @@ func (a *agentClient) consumeAgentFrames(pending []byte, result *agentRunResult,
 		}
 		payload := pending[5 : 5+length]
 		pending = pending[5+length:]
+		if result.Trace.Enabled {
+			result.Trace.Frames++
+			if flags&0x01 != 0 {
+				result.Trace.Compressed++
+			}
+		}
 
 		if flags&0x02 != 0 { // trailer frame: end of stream metadata
-			continue
+			code := decodeAgentTrailerCode(payload, flags)
+			result.TrailerCode = code
+			if result.Trace.Enabled {
+				result.Trace.Trailers++
+				result.Trace.TrailerCode = code
+			}
+			if code != "ok" {
+				result.Fatal = "cursor AgentService " + code
+			}
+			result.Ended = true
+			break
 		}
 		if flags&0x01 != 0 { // gzip
 			var err error
 			payload, err = gunzip(payload)
 			if err != nil {
+				if result.Trace.Enabled {
+					result.Trace.DecompressFailures++
+				}
 				continue
 			}
 		}
 		a.handleAgentPayload(payload, result, onDelta)
-		if result.Finished || result.Fatal != "" {
+		if result.Ended || result.Fatal != "" {
 			break
 		}
 	}
 	return pending
 }
 
-func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult, onDelta func(string)) {
-	update, execRequest, execSupported := decodeAgentServerMessage(payload)
-	if execRequest {
-		if execSupported {
-			// The server wants IDE context; acknowledge with an empty one.
-			if err := a.write(createRequestContextResponse()); err != nil {
-				result.Fatal = fmt.Sprintf("cursor AgentService context write failed: %v", err)
-			}
-		} else {
-			// Every other exec variant is an editor-backed tool (shell, read,
-			// write, …) this headless plugin cannot service; failing beats
-			// narrating protocol state as assistant text.
-			result.Fatal = "cursor AgentService requested an unsupported IDE tool"
+// agentPayloadTap 仅供 live 测试观察上游帧；生产环境保持 nil。
+var agentPayloadTap func(payload []byte)
+
+func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult, onDelta func(string) error) {
+	if agentPayloadTap != nil {
+		agentPayloadTap(payload)
+	}
+	fields := decodeMessage(payload)
+	if kv, ok := fieldFirst(fields, 4); ok && kv.IsLen {
+		if a.context == nil {
+			a.context = &agentContext{blobs: make(map[string][]byte)}
+		}
+		response, err := a.context.kvResponse(kv.Value)
+		if err == nil {
+			err = a.write(response)
+		}
+		if err != nil {
+			result.Fatal = "cursor AgentService KV exchange failed"
+			result.Finished = true
 		}
 		return
+	}
+	if query, ok := fieldFirst(fields, 7); ok && query.IsLen {
+		response, handled := agentInteractionResponse(query.Value)
+		if !handled {
+			result.Fatal = "cursor invalid_request_error: unsupported Cursor interaction query"
+			return
+		}
+		if err := a.write(response); err != nil {
+			result.Fatal = fmt.Sprintf("cursor AgentService interaction write failed: %v", err)
+		}
+		return
+	}
+	update, execRequest, execSupported := decodeAgentServerMessage(payload)
+	if execRequest {
+		if result.Trace.Enabled {
+			result.Trace.ContextRequests++
+		}
+		if execSupported {
+			// 按 RequestContext 契约返回本次请求的系统规则。
+			exec, _ := fieldFirst(fields, 2)
+			if err := a.write(a.context.contextResponse(exec.Value)); err != nil {
+				result.Fatal = fmt.Sprintf("cursor AgentService context write failed: %v", err)
+			}
+		} else if a.context != nil && a.context.tools != nil && a.onTool != nil {
+			exec, _ := fieldFirst(fields, 2)
+			tool, reply, err := a.context.tools.parseExec(exec.Value)
+			if err == nil && len(reply) > 0 {
+				a.toolRejections++
+				if a.toolRejections > 16 {
+					err = fmt.Errorf("too many unsupported native tools")
+				} else {
+					err = a.write(reply)
+				}
+			}
+			if err == nil && tool != nil {
+				err = a.onTool(tool)
+			}
+			if err != nil {
+				result.Fatal = "cursor invalid_request_error: tool protocol unavailable: " + err.Error()
+			}
+		} else {
+			result.Fatal = "cursor invalid_request_error: no client tool was declared for the requested IDE operation"
+		}
+		return
+	}
+	if result.Trace.Enabled {
+		if update.TextDelta != "" {
+			result.Trace.TextEvents++
+		}
+		if update.Finished {
+			result.Trace.FinishEvents++
+		}
+		if update.TextDelta == "" && !update.Finished {
+			fields := decodeMessage(payload)
+			if len(payload) > 0 && len(fields) == 0 {
+				result.Trace.MalformedFrames++
+			} else if _, hasUpdate := fieldFirst(fields, 1); !hasUpdate {
+				result.Trace.UnknownFrames++
+			} else {
+				result.Trace.OtherEvents++
+			}
+		}
 	}
 	if update.TextDelta != "" {
 		result.Text += update.TextDelta
 		if onDelta != nil {
-			onDelta(update.TextDelta)
+			if err := onDelta(update.TextDelta); err != nil {
+				result.Fatal = "cursor AgentService downstream write failed"
+				if a.cancel != nil {
+					a.cancel()
+				}
+				return
+			}
 		}
 	}
 	if update.Finished {

@@ -22,6 +22,8 @@ type parsedChat struct {
 	AgentEligible bool
 	// InputChars feeds the chars/4 usage estimate.
 	InputChars int
+	// 保留原生工具历史，续传时验证和回填，不降级为文本对话。
+	RawMessages []openAIMessage
 }
 
 type openAIToolCall struct {
@@ -150,7 +152,7 @@ func parseChatRequest(body []byte) (*parsedChat, error) {
 		}
 	}
 
-	parsed := &parsedChat{AgentEligible: true}
+	parsed := &parsedChat{AgentEligible: true, RawMessages: req.Messages}
 	inputChars := 0
 	for _, m := range req.Messages {
 		switch m.Role {

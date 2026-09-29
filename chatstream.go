@@ -139,8 +139,12 @@ func classifyUpstreamError(message string) *statusError {
 
 // runAgentTurn drives the native-h2 AgentService run for plain-text turns.
 func runAgentTurn(prepared *preparedChat, emitter *chunkEmitter) *statusError {
+	if len(prepared.parsed.Tools) > 0 || hasAgentToolResult(prepared.parsed.RawMessages) {
+		return runAgentToolBridge(prepared, emitter)
+	}
 	headers := buildCursorHeaders(prepared.identity)
-	runFrame := buildAgentRunFrame(prepared.parsed.Messages, prepared.model)
+	requestContext := newAgentContext(prepared.parsed.Messages)
+	runFrame := buildAgentRunFrame(prepared.parsed.Messages, prepared.model, requestContext)
 
 	ctx, cancel := contextBackgroundWithTimeout()
 	defer cancel()
@@ -150,14 +154,19 @@ func runAgentTurn(prepared *preparedChat, emitter *chunkEmitter) *statusError {
 			"cursor AgentService request failed: "+err.Error())
 	}
 	defer client.close()
+	client.context = requestContext
 
-	result := client.runTurn(runFrame, func(delta string) {
-		_ = emitter.textDelta(delta)
-	})
+	result := client.runTurn(runFrame, func(delta string) error {
+		return emitter.textDelta(delta)
+	}, traceAgentModel(prepared.model))
+	recordAgentTrace(prepared.model, result)
 	if result.Fatal != "" {
 		return classifyAgentFailure(result.Fatal)
 	}
 	if strings.TrimSpace(result.Text) == "" && !emitter.sawToolCalls() {
+		if result.TrailerCode != "" && result.TrailerCode != "ok" {
+			return classifyAgentFailure("cursor AgentService " + result.TrailerCode)
+		}
 		return newStatusError(http.StatusBadGateway, "upstream_error", "cursor AgentService returned no content")
 	}
 	return nil
@@ -172,6 +181,10 @@ func classifyAgentFailure(message string) *statusError {
 		return newStatusError(http.StatusUnauthorized, "invalid_credential", message)
 	case strings.Contains(lower, "429"), strings.Contains(lower, "resource_exhausted"):
 		return newStatusError(http.StatusTooManyRequests, "rate_limit_error", message)
+	case strings.Contains(lower, "invalid_argument"), strings.Contains(lower, "invalid_request_error"):
+		return newStatusError(http.StatusBadRequest, "invalid_request_error", "cursor AgentService rejected the request: "+message)
+	case strings.Contains(lower, "eof"), strings.Contains(lower, "tls"), strings.Contains(lower, "connection reset"):
+		return newStatusError(http.StatusBadGateway, "upstream_network_error", message)
 	default:
 		return newStatusError(http.StatusBadGateway, "upstream_error", message)
 	}

@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginName    = "cpa-cursor"
-	pluginVersion = "0.3.9"
+	pluginVersion = "0.3.14"
 	providerKey   = "cursor"
 	logPrefix     = "[cpa-cursor] "
 )
@@ -20,7 +20,9 @@ func main() { fmt.Println(pluginName, pluginVersion) }
 
 // pluginConfig is the plugins.configs.cpa-cursor block in config.yaml.
 type pluginConfig struct {
-	Enabled bool `yaml:"enabled"`
+	Enabled               bool   `yaml:"enabled"`
+	AgentDiagnostics      bool   `yaml:"agent_diagnostics"`
+	AgentDiagnosticsModel string `yaml:"agent_diagnostics_model"`
 }
 
 func defaultConfig() pluginConfig {
@@ -44,6 +46,7 @@ func configure(raw []byte) error {
 			}
 		}
 	}
+	setAgentDiagnostics(cfg.AgentDiagnostics, cfg.AgentDiagnosticsModel)
 	return nil
 }
 
@@ -68,9 +71,9 @@ func pluginRegistration() registration {
 	return registration{
 		SchemaVersion: pluginabi.SchemaVersion,
 		Metadata: pluginapi.Metadata{
-			Name:            pluginName,
-			Version:         pluginVersion,
-			Author:          "szxypi",
+			Name:             pluginName,
+			Version:          pluginVersion,
+			Author:           "szxypi",
 			GitHubRepository: "szxypi/cpa-cursor",
 			ConfigFields: []pluginapi.ConfigField{
 				{
@@ -132,7 +135,10 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 	case pluginabi.MethodManagementHandle:
 		return handleManagementRequest(request)
 
-	case pluginabi.MethodPluginQuiesce, pluginabi.MethodPluginShutdown:
+	case pluginabi.MethodPluginShutdown:
+		pendingAgentTools.shutdown()
+		return okEnvelope(map[string]any{})
+	case pluginabi.MethodPluginQuiesce:
 		return okEnvelope(map[string]any{})
 
 	default:
@@ -141,7 +147,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 // shutdownEngine is invoked from the C ABI shutdown hook.
-func shutdownEngine() {}
+func shutdownEngine() { pendingAgentTools.shutdown() }
 
 // handleModelStatic reports no models: every cursor model is account-scoped
 // and arrives through model.for_auth.

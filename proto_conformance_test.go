@@ -94,13 +94,33 @@ func TestAgentFrameMatches9router(t *testing.T) {
 		{Role: "assistant", Content: "hello"},
 		{Role: "user", Content: "what is 2+2"},
 	}
-	got := hex.EncodeToString(buildAgentRunFrame(messages, "composer-1"))
+	// 9router 旧样本含当前 Cursor 已拒绝的 field 8。
+	// 无 system 时其余字段继续与旧样本逐字节一致，system 兼容另测。
+	got := hex.EncodeToString(buildAgentRunFrame(messages[1:], "composer-1"))
 
 	wantBytes, err := os.ReadFile("want-9router-agent.txt")
 	if err != nil {
 		t.Skipf("run scripts/conformance/run.mjs first: %v", err)
 	}
-	want := strings.TrimSpace(string(wantBytes))
+	legacy, err := hex.DecodeString(strings.TrimSpace(string(wantBytes)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, ok := fieldFirst(decodeMessage(legacy[5:]), 1)
+	if !ok {
+		t.Fatal("missing legacy run_request")
+	}
+	var compatible []byte
+	for _, f := range decodeMessage(run.Value) {
+		if f.Number == 8 {
+			continue
+		}
+		if !f.IsLen {
+			t.Fatal("unexpected legacy wire type")
+		}
+		compatible = append(compatible, fieldBytes(f.Number, f.Value)...)
+	}
+	want := hex.EncodeToString(wrapConnectFrame(fieldBytes(1, compatible)))
 	if got != want {
 		t.Fatalf("agent frame mismatch:\n got  %s\n want %s", got, want)
 	}

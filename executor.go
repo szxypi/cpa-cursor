@@ -40,6 +40,8 @@ type preparedChat struct {
 	agentPath bool
 	// forceAgent presents the ChatService turn as agentic (Claude Code UA).
 	forceAgent bool
+	binding    [32]byte
+	toolErrors map[string]bool
 }
 
 func prepareChat(req rpcExecutorRequest) (*preparedChat, *statusError) {
@@ -69,8 +71,12 @@ func prepareChat(req rpcExecutorRequest) (*preparedChat, *statusError) {
 		parsed:      parsed,
 		model:       model,
 		clientModel: strings.TrimSpace(req.Model),
-		agentPath:   parsed.AgentEligible,
-		forceAgent:  forceAgentMode,
+		// ChatService 已以「客户端版本过旧」拒绝请求；外来工具历史在 parsed.Messages 中
+		// 已渲染为文本，同样可以走 AgentService。
+		agentPath:  true,
+		binding:    agentRequestBinding(req.ExecutorRequest, model),
+		toolErrors: originalToolErrors(req.OriginalRequest),
+		forceAgent: forceAgentMode,
 	}, nil
 }
 
@@ -303,6 +309,31 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 		return statusErr.envelope(), nil
 	}
 
+	if prepared.agentPath {
+		// 一个逻辑轮次先确定工具暂停/结束/错误，再交给宿主，防止
+		// host.stream.close 的无状态错误字符串触发错误的凭据冷却。
+		var chunks [][]byte
+		emitter := newChunkEmitter(prepared.clientModel, isComposerModel(prepared.model), hostFramesChunks(req), func(chunk []byte) error { chunks = append(chunks, append([]byte(nil), chunk...)); return nil })
+		if err := runPrepared(prepared, req.HostCallbackID, emitter); err != nil {
+			return err.envelope(), nil
+		}
+		if err := emitter.finishChunk(prepared.parsed.InputChars); err != nil {
+			return asStatusError(err, 500, "stream_error").envelope(), nil
+		}
+		go func() {
+			for _, chunk := range chunks {
+				if err := hostStreamEmit(streamID, chunk); err != nil {
+					for _, id := range emitter.toolOrder {
+						pendingAgentTools.discard(id)
+					}
+					hostStreamClose(streamID, err.Error())
+					return
+				}
+			}
+			hostStreamClose(streamID, "")
+		}()
+		return okEnvelope(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
+	}
 	go func() {
 		emitter := newChunkEmitter(prepared.clientModel, isComposerModel(prepared.model), hostFramesChunks(req), func(chunk []byte) error {
 			return hostStreamEmit(streamID, chunk)
