@@ -565,6 +565,58 @@ type agentTurnStats struct {
 	mode    string
 	miss    string
 	rejects map[int]int
+	// outTokens 累加 token_delta，是本 HTTP 轮次实际生成的 token；ended 之后的字段来自
+	// Cursor turn_ended，是整个上游 run 的累计值。
+	outTokens  int64
+	ended      bool
+	inTokens   int64
+	cacheRead  int64
+	cacheWrite int64
+	reasoning  int64
+}
+
+func (s *agentTurnStats) addOutputTokens(n int64) {
+	if s == nil || n <= 0 {
+		return
+	}
+	s.mu.Lock()
+	s.outTokens += n
+	s.mu.Unlock()
+}
+
+func (s *agentTurnStats) setTurnEnded(in, out, cacheRead, cacheWrite, reasoning int64) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.ended = true
+	s.inTokens, s.cacheRead, s.cacheWrite, s.reasoning = in, cacheRead, cacheWrite, reasoning
+	if s.outTokens == 0 {
+		s.outTokens = out
+	}
+	s.mu.Unlock()
+}
+
+// usage 返回上游报告的用量；ok=false 表示没有收到任何 token 信息，调用方应退回估算。
+func (s *agentTurnStats) usage() (in, out, cacheRead int64, hasIn, hasOut bool) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.inTokens, s.outTokens, s.cacheRead, s.ended && s.inTokens > 0, s.outTokens > 0
+}
+
+func (s *agentTurnStats) tokenSummary() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if !s.ended {
+		return fmt.Sprintf("out=%d", s.outTokens)
+	}
+	return fmt.Sprintf("in=%d out=%d cache_read=%d cache_write=%d reasoning=%d", s.inTokens, s.outTokens, s.cacheRead, s.cacheWrite, s.reasoning)
 }
 
 func (s *agentTurnStats) setMiss(reason string) {

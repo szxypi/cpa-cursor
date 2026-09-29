@@ -283,6 +283,9 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 		}
 		return
 	}
+	if u, ok := fieldFirst(fields, 1); ok && u.IsLen {
+		a.observeUsage(u.Value)
+	}
 	update, execRequest, execSupported := decodeAgentServerMessage(payload)
 	if execRequest {
 		if result.Trace.Enabled {
@@ -359,6 +362,30 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 	}
 	if update.Finished {
 		result.Finished = true
+	}
+}
+
+// observeUsage 记录 InteractionUpdate 中的 token_delta(8) 与 turn_ended(14)。
+func (a *agentClient) observeUsage(update []byte) {
+	stats := a.stats.Load()
+	for _, f := range decodeMessage(update) {
+		if !f.IsLen {
+			continue
+		}
+		switch f.Number {
+		case 8:
+			if n, ok := fieldFirst(decodeMessage(f.Value), 1); ok && !n.IsLen {
+				stats.addOutputTokens(int64(int32(n.Varint)))
+			}
+		case 14:
+			var v [6]int64
+			for _, g := range decodeMessage(f.Value) {
+				if !g.IsLen && g.Number >= 1 && g.Number <= 5 {
+					v[g.Number] = int64(g.Varint)
+				}
+			}
+			stats.setTurnEnded(v[1], v[2], v[3], v[4], v[5])
+		}
 	}
 }
 

@@ -743,3 +743,45 @@ func TestAgentNativeExecWithoutDeclaredTools(t *testing.T) {
 	}
 	pw.Close()
 }
+
+// 上游 token_delta/turn_ended 必须进入 usage；只返回工具调用的轮次输出不能再是 0。
+func TestAgentUsageFromUpstream(t *testing.T) {
+	stats := &agentTurnStats{}
+	client := &agentClient{}
+	client.stats.Store(stats)
+	client.observeUsage(fieldBytes(8, fieldVarint(1, 40)))
+	client.observeUsage(fieldBytes(8, fieldVarint(1, 2)))
+	client.observeUsage(fieldBytes(14, concat(fieldVarint(1, 1200), fieldVarint(2, 99), fieldVarint(3, 800))))
+	var out []byte
+	emitter := newChunkEmitter("m", false, false, func(b []byte) error { out = append([]byte(nil), b...); return nil })
+	emitter.stats = stats
+	if err := emitter.toolCall(&toolCallResult{ID: "call_x", Name: "Read", Arguments: `{"file_path":"a"}`, IsLast: true}); err != nil {
+		t.Fatal(err)
+	}
+	var last []byte
+	emitter.emit = func(b []byte) error {
+		if string(b) != "[DONE]" {
+			last = append([]byte(nil), b...)
+		}
+		return nil
+	}
+	if err := emitter.finishChunk(10); err != nil {
+		t.Fatal(err)
+	}
+	_ = out
+	var chunk struct {
+		Usage struct {
+			Prompt     int `json:"prompt_tokens"`
+			Completion int `json:"completion_tokens"`
+			Details    struct {
+				Cached int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(last, &chunk); err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Usage.Prompt != 1200 || chunk.Usage.Completion != 42 || chunk.Usage.Details.Cached != 800 {
+		t.Fatalf("usage = %+v", chunk.Usage)
+	}
+}

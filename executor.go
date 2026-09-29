@@ -131,6 +131,7 @@ type chunkEmitter struct {
 	toolSeen       map[string]bool
 	toolPending    map[string]*toolCallResult
 	outputChars    int
+	stats          *agentTurnStats
 	thinking       strings.Builder
 	visibleEmitted int
 }
@@ -229,6 +230,7 @@ func (e *chunkEmitter) toolCall(call *toolCallResult) error {
 		return nil
 	}
 	delete(e.toolPending, call.ID)
+	e.outputChars += len(call.Name) + len(call.Arguments)
 	e.toolOrder = append(e.toolOrder, call.ID)
 	e.finish = "tool_calls"
 	index := len(e.toolOrder) - 1
@@ -267,11 +269,22 @@ func (e *chunkEmitter) finishChunk(promptChars int) error {
 	if finish == "" {
 		finish = "stop"
 	}
-	usage := map[string]any{
-		"prompt_tokens":     estimateTokensLen(promptChars),
-		"completion_tokens": estimateTokensLen(e.outputChars),
+	prompt, completion := estimateTokensLen(promptChars), estimateTokensLen(e.outputChars)
+	in, out, cacheRead, hasIn, hasOut := e.stats.usage()
+	if hasIn {
+		prompt = int(in)
 	}
-	usage["total_tokens"] = usage["prompt_tokens"].(int) + usage["completion_tokens"].(int)
+	if hasOut && int(out) > completion {
+		completion = int(out)
+	}
+	usage := map[string]any{
+		"prompt_tokens":     prompt,
+		"completion_tokens": completion,
+		"total_tokens":      prompt + completion,
+	}
+	if hasIn && cacheRead > 0 {
+		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cacheRead}
+	}
 	chunk := e.baseChunk(map[string]any{})
 	choices := chunk["choices"].([]any)
 	choices[0].(map[string]any)["finish_reason"] = finish
@@ -347,6 +360,7 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 
 	aggregator := newCompletionAggregator(prepared.clientModel)
 	emitter := newChunkEmitter(prepared.clientModel, isComposerModel(prepared.model), false, aggregator.consume)
+	emitter.stats = prepared.stats
 	if err := runPrepared(prepared, req.HostCallbackID, emitter); err != nil {
 		return err.envelope(), nil
 	}
@@ -402,6 +416,7 @@ func streamAgentTurn(prepared *preparedChat, req rpcExecutorRequest, streamID st
 		}
 		return hostStreamEmit(streamID, chunk)
 	})
+	emitter.stats = prepared.stats
 	done := make(chan *statusError, 1)
 	go func() {
 		status := runPrepared(prepared, req.HostCallbackID, emitter)
@@ -421,8 +436,8 @@ func streamAgentTurn(prepared *preparedChat, req rpcExecutorRequest, streamID st
 		mu.Lock()
 		firstMS := firstAt.Milliseconds()
 		mu.Unlock()
-		hostLog("info", fmt.Sprintf("turn model=%s mode=%s first_ms=%d total_ms=%d finish=%s native_rejects=%s outcome=%s",
-			prepared.model, mode, firstMS, time.Since(started).Milliseconds(), emitter.finish, rejects, outcome))
+		hostLog("info", fmt.Sprintf("turn model=%s mode=%s first_ms=%d total_ms=%d finish=%s native_rejects=%s tokens=[%s] outcome=%s",
+			prepared.model, mode, firstMS, time.Since(started).Milliseconds(), emitter.finish, rejects, prepared.stats.tokenSummary(), outcome))
 	}
 	discardTools := func() {
 		for _, id := range emitter.toolOrder {
