@@ -144,6 +144,7 @@ func (c *agentToolCatalog) parseExec(exec []byte) (*agentToolRequest, []byte, er
 	var hasExecID bool
 	var hasID bool
 	var execField *agentProtoField
+	unknownExec := 0
 	for i := range outer {
 		field := outer[i]
 		switch field.number {
@@ -176,14 +177,21 @@ func (c *agentToolCatalog) parseExec(exec []byte) (*agentToolRequest, []byte, er
 			}
 			execField = &field
 		default:
-			return nil, nil, fmt.Errorf("unknown ExecServerMessage field %d", field.number)
+			// 未知的 oneof 成员（Cursor 新增或未支持的执行类型）按 throw 处理；
+			// 其余未知的非 oneof 字段忽略。
+			if field.wire == wireLen && unknownExec == 0 {
+				unknownExec = field.number
+			}
 		}
-	}
-	if execField == nil {
-		return nil, nil, errors.New("ExecServerMessage has no supported tool field")
 	}
 	if !hasID {
 		return nil, nil, errors.New("ExecServerMessage is missing field 1")
+	}
+	if execField == nil {
+		if unknownExec != 0 {
+			return nil, agentExecThrowFrames(id, fmt.Sprintf("Cursor exec type %d is not supported by this client; use one of the client's declared tools.", unknownExec)), nil
+		}
+		return nil, nil, errors.New("ExecServerMessage has no supported tool field")
 	}
 
 	if execField.number == 11 {
@@ -203,9 +211,6 @@ func (c *agentToolCatalog) parseExec(exec []byte) (*agentToolRequest, []byte, er
 	if err := validateNativeArgs(nativeArgs, execField.number); err != nil {
 		return nil, nil, err
 	}
-	if _, err := agentSingularFields(nativeArgs, nativeArgsRepeated(execField.number)); err != nil {
-		return nil, nil, fmt.Errorf("invalid %s: %w", nativeArgsName(execField.number), err)
-	}
 	if execField.number == 7 {
 		if request, ok, err := c.mapNativeRead(id, execID, hasExecID, nativeArgs); err != nil {
 			return nil, nil, err
@@ -213,7 +218,10 @@ func (c *agentToolCatalog) parseExec(exec []byte) (*agentToolRequest, []byte, er
 			return request, nil, nil
 		}
 	}
-	return nil, nativeToolRejectionFrame(id, execID, hasExecID, *execField), nil
+	if frame := nativeToolRejectionFrame(id, execID, hasExecID, *execField); frame != nil {
+		return nil, frame, nil
+	}
+	return nil, agentExecThrowFrames(id, agentToolPermissionMessage), nil
 }
 
 // mcpStateFrame 回复 mcp_state_exec_args=36 的状态查询，只返回本目录声明的工具。
@@ -947,13 +955,15 @@ func nativeToolRejectionFrame(id uint32, execID string, hasExecID bool, request 
 	if err != nil {
 		return nil
 	}
-	spec, pathField := nativeArgsSpec(request.number)
-	if err := validateAgentWireFields(args, nativeArgsName(request.number), spec); err != nil {
+	_, pathField := nativeArgsSpec(request.number)
+	if err := validateNativeArgs(args, request.number); err != nil {
 		return nil
 	}
-	fields, err := agentSingularFields(args, nativeArgsRepeated(request.number))
-	if err != nil {
-		return nil
+	fields := make(map[int]agentProtoField, len(args))
+	for _, field := range args {
+		if _, seen := fields[field.number]; !seen {
+			fields[field.number] = field
+		}
 	}
 	if pathField != 0 {
 		if value, ok := fields[pathField]; ok && utf8.Valid(value.bytes) {
@@ -1042,17 +1052,6 @@ func nativeArgsSpec(field int) (map[int]int, int) {
 	}
 }
 
-func nativeArgsRepeated(field int) map[int]bool {
-	switch field {
-	case 2, 14:
-		return map[int]bool{5: true} // ShellArgs.simple_commands。
-	case 8:
-		return map[int]bool{2: true} // LsArgs.ignore。
-	default:
-		return nil
-	}
-}
-
 func encodeAgentClientMessage(id uint32, execID string, hasExecID bool, messageField int, message []byte) []byte {
 	execClientMessage := fieldVarint(1, uint64(id))
 	if hasExecID {
@@ -1133,7 +1132,41 @@ func agentInteractionResponse(query []byte) ([]byte, bool) {
 	return wrapConnectFrame(fieldBytes(6, response)), true // AgentClientMessage.interaction_response
 }
 
+// validateNativeArgs 只校验已知字段的 wire type：原生工具参数一律被拒绝或按需映射，
+// Cursor 新增的字段（如 ShellArgs 23）不应让整轮失败。
 func validateNativeArgs(fields []agentProtoField, execField int) error {
 	spec, _ := nativeArgsSpec(execField)
-	return validateAgentWireFields(fields, nativeArgsName(execField), spec)
+	for _, field := range fields {
+		if want, known := spec[field.number]; known && field.wire != want {
+			return fmt.Errorf("invalid %s field %d wire type", nativeArgsName(execField), field.number)
+		}
+	}
+	return nil
+}
+
+// agentExecThrowFrames 以 ExecClientThrow + stream_close 回复无法处理的 exec，
+// 与 Cursor 自带执行器对未知消息的处理一致，服务端会把错误交给模型而不是阻塞。
+func agentExecThrowFrames(id uint32, message string) []byte {
+	throw := fieldBytes(2, concat(fieldVarint(1, uint64(id)), fieldString(2, message)))
+	closeStream := fieldBytes(1, fieldVarint(1, uint64(id)))
+	return concat(
+		wrapConnectFrame(fieldBytes(5, throw)),
+		wrapConnectFrame(fieldBytes(5, closeStream)),
+	)
+}
+
+// agentExecKind 返回 ExecServerMessage 中工具 oneof 的字段号，仅用于统计。
+func agentExecKind(exec []byte) int {
+	fields, err := decodeAgentProto(exec)
+	if err != nil {
+		return 0
+	}
+	for _, field := range fields {
+		switch field.number {
+		case 1, 15, 19, 55:
+		default:
+			return field.number
+		}
+	}
+	return 0
 }

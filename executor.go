@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
@@ -42,6 +43,7 @@ type preparedChat struct {
 	forceAgent bool
 	binding    [32]byte
 	toolErrors map[string]bool
+	stats      *agentTurnStats
 }
 
 func prepareChat(req rpcExecutorRequest) (*preparedChat, *statusError) {
@@ -76,6 +78,7 @@ func prepareChat(req rpcExecutorRequest) (*preparedChat, *statusError) {
 		agentPath:  true,
 		binding:    agentRequestBinding(req.ExecutorRequest, model),
 		toolErrors: originalToolErrors(req.OriginalRequest),
+		stats:      &agentTurnStats{},
 		forceAgent: forceAgentMode,
 	}, nil
 }
@@ -310,29 +313,7 @@ func handleExecutorExecuteStream(request []byte) ([]byte, error) {
 	}
 
 	if prepared.agentPath {
-		// 一个逻辑轮次先确定工具暂停/结束/错误，再交给宿主，防止
-		// host.stream.close 的无状态错误字符串触发错误的凭据冷却。
-		var chunks [][]byte
-		emitter := newChunkEmitter(prepared.clientModel, isComposerModel(prepared.model), hostFramesChunks(req), func(chunk []byte) error { chunks = append(chunks, append([]byte(nil), chunk...)); return nil })
-		if err := runPrepared(prepared, req.HostCallbackID, emitter); err != nil {
-			return err.envelope(), nil
-		}
-		if err := emitter.finishChunk(prepared.parsed.InputChars); err != nil {
-			return asStatusError(err, 500, "stream_error").envelope(), nil
-		}
-		go func() {
-			for _, chunk := range chunks {
-				if err := hostStreamEmit(streamID, chunk); err != nil {
-					for _, id := range emitter.toolOrder {
-						pendingAgentTools.discard(id)
-					}
-					hostStreamClose(streamID, err.Error())
-					return
-				}
-			}
-			hostStreamClose(streamID, "")
-		}()
-		return okEnvelope(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
+		return streamAgentTurn(prepared, req, streamID), nil
 	}
 	go func() {
 		emitter := newChunkEmitter(prepared.clientModel, isComposerModel(prepared.model), hostFramesChunks(req), func(chunk []byte) error {
@@ -395,4 +376,109 @@ func runPrepared(prepared *preparedChat, hostCallbackID string, emitter *chunkEm
 // answer inside the thinking channel, fenced by </think>.
 func isComposerModel(model string) bool {
 	return strings.Contains(model, "composer")
+}
+
+// streamAgentTurn 在首个输出（文本或工具调用）到达前不向宿主开流：此前出现的错误仍以
+// 带状态码的错误信封返回，宿主据此正确区分请求错误与凭据故障，不会误冷却；首个输出
+// 之后实时转发，客户端不必等整轮生成完才看到内容。
+func streamAgentTurn(prepared *preparedChat, req rpcExecutorRequest, streamID string) []byte {
+	started := time.Now()
+	var mu sync.Mutex
+	var buffered [][]byte
+	live := false
+	firstAt := time.Duration(0)
+	first := make(chan struct{})
+	var firstOnce sync.Once
+	emitter := newChunkEmitter(prepared.clientModel, isComposerModel(prepared.model), hostFramesChunks(req), func(chunk []byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		if !live {
+			if firstAt == 0 {
+				firstAt = time.Since(started)
+			}
+			buffered = append(buffered, append([]byte(nil), chunk...))
+			firstOnce.Do(func() { close(first) })
+			return nil
+		}
+		return hostStreamEmit(streamID, chunk)
+	})
+	done := make(chan *statusError, 1)
+	go func() {
+		status := runPrepared(prepared, req.HostCallbackID, emitter)
+		if status == nil {
+			if err := emitter.finishChunk(prepared.parsed.InputChars); err != nil {
+				status = asStatusError(err, 500, "stream_error")
+			}
+		}
+		done <- status
+	}()
+	logTurn := func(status *statusError) {
+		mode, rejects := prepared.stats.summary()
+		outcome := "ok"
+		if status != nil {
+			outcome = fmt.Sprintf("%d %s", status.status, status.message)
+		}
+		mu.Lock()
+		firstMS := firstAt.Milliseconds()
+		mu.Unlock()
+		hostLog("info", fmt.Sprintf("turn model=%s mode=%s first_ms=%d total_ms=%d finish=%s native_rejects=%s outcome=%s",
+			prepared.model, mode, firstMS, time.Since(started).Milliseconds(), emitter.finish, rejects, outcome))
+	}
+	discardTools := func() {
+		for _, id := range emitter.toolOrder {
+			pendingAgentTools.discard(id)
+		}
+	}
+	headers := okEnvelopeMust(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
+
+	select {
+	case status := <-done:
+		logTurn(status)
+		if status != nil {
+			discardTools()
+			return status.envelope()
+		}
+		go func() {
+			for _, chunk := range buffered {
+				if err := hostStreamEmit(streamID, chunk); err != nil {
+					discardTools()
+					hostStreamClose(streamID, err.Error())
+					return
+				}
+			}
+			hostStreamClose(streamID, "")
+		}()
+		return headers
+	case <-first:
+	}
+	go func() {
+		mu.Lock()
+		var emitErr error
+		for _, chunk := range buffered {
+			if emitErr = hostStreamEmit(streamID, chunk); emitErr != nil {
+				break
+			}
+		}
+		buffered = nil
+		live = emitErr == nil
+		mu.Unlock()
+		status := <-done
+		logTurn(status)
+		switch {
+		case emitErr != nil:
+			discardTools()
+			hostStreamClose(streamID, emitErr.Error())
+		case status != nil:
+			discardTools()
+			hostStreamClose(streamID, status.Error())
+		default:
+			hostStreamClose(streamID, "")
+		}
+	}()
+	return headers
+}
+
+func okEnvelopeMust(payload map[string]any) []byte {
+	envelope, _ := okEnvelope(payload)
+	return envelope
 }

@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -350,6 +351,7 @@ func startAgentBridge(p *preparedChat) (*agentBridgeSession, *statusError) {
 	state := newAgentContext(p.parsed.Messages)
 	state.tools = catalog
 	client.context = state
+	client.stats.Store(p.stats)
 	s := &agentBridgeSession{ctx: ctx, cancel: cancel, client: client, release: release, events: make(chan agentBridgeEvent, 128)}
 	client.onTool = func(tool *agentToolRequest) error {
 		return s.publish(agentBridgeEvent{Tool: tool, ID: agentToolIDPrefix + strings.ReplaceAll(randomUUID(), "-", "")})
@@ -469,6 +471,7 @@ func runAgentToolBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 			return status
 		}
 		if replay {
+			p.stats.setMode("replay")
 			for _, e := range call.replay {
 				if err := emitAgentBridgeEvent(e, emitter); err != nil {
 					return newStatusError(502, "stream_error", "tool replay delivery failed")
@@ -476,6 +479,8 @@ func runAgentToolBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 			}
 			return call.err
 		}
+		p.stats.setMode("resume")
+		call.session.client.stats.Store(p.stats)
 		// OpenAI tool 结果是实际客户端输出；不在网关执行，也不伪造输出。
 		if err := call.session.client.write(call.tool.resultFrame(contentText(result.Content), p.toolErrors[id])); err != nil {
 			call.session.close()
@@ -492,10 +497,57 @@ func runAgentToolBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 
 // runFreshAgentBridge 以完整历史开启新的上游 run；历史中的工具调用结果只作为上下文。
 func runFreshAgentBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
+	if hasAgentToolResult(p.parsed.RawMessages) {
+		p.stats.setMode("fresh-history")
+	} else {
+		p.stats.setMode("fresh")
+	}
 	session, status := startAgentBridge(p)
 	if status != nil {
 		return status
 	}
 	_, status = consumeAgentBridge(session, p, emitter)
 	return status
+}
+
+// agentTurnStats 汇总一个 HTTP 轮次的上游行为，用于日志定位慢与失败；不含请求内容。
+type agentTurnStats struct {
+	mu      sync.Mutex
+	mode    string
+	rejects map[int]int
+}
+
+func (s *agentTurnStats) setMode(mode string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.mode = mode
+	s.mu.Unlock()
+}
+
+func (s *agentTurnStats) reject(kind int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.rejects == nil {
+		s.rejects = make(map[int]int)
+	}
+	s.rejects[kind]++
+	s.mu.Unlock()
+}
+
+func (s *agentTurnStats) summary() (string, string) {
+	if s == nil {
+		return "", ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kinds := make([]string, 0, len(s.rejects))
+	for kind, count := range s.rejects {
+		kinds = append(kinds, fmt.Sprintf("%d:%d", kind, count))
+	}
+	sort.Strings(kinds)
+	return s.mode, strings.Join(kinds, ",")
 }

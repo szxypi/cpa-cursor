@@ -19,12 +19,21 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
+// agentHTTPClient 在所有 run 间共享同一个 h2 连接池：每轮新建 transport 意味着
+// 每次都要重新经代理做 TLS/HTTP2 握手，是首字延迟的主要固定开销。
+var agentHTTPClient = &http.Client{Transport: &http.Transport{
+	ForceAttemptHTTP2:   true,
+	IdleConnTimeout:     90 * time.Second,
+	TLSHandshakeTimeout: 15 * time.Second,
+	Proxy:               http.ProxyFromEnvironment,
+}}
+
 // agentClient wraps one duplex AgentService run.
 type agentClient struct {
-	client         *http.Client
 	pr             *io.PipeReader
 	pw             *io.PipeWriter
 	resp           *http.Response
@@ -33,10 +42,22 @@ type agentClient struct {
 	onTool         func(*agentToolRequest) error
 	writeMu        sync.Mutex
 	toolRejections int
+	// stats 指向当前正在消费本 run 的 HTTP 轮次；续接时会切换。
+	stats atomic.Pointer[agentTurnStats]
 }
 
 // openAgentStream starts a POST whose body stays open for mid-flight writes.
+// 收到响应头之前的连接错误（多为代理掐断的复用连接返回 EOF）重试一次：此时 run
+// 帧尚未写入，重试不会重复提交。
 func openAgentStream(ctx context.Context, url string, headers map[string]string) (*agentClient, int, error) {
+	client, status, err := openAgentStreamOnce(ctx, url, headers)
+	if err != nil && status == 0 && ctx.Err() == nil {
+		client, status, err = openAgentStreamOnce(ctx, url, headers)
+	}
+	return client, status, err
+}
+
+func openAgentStreamOnce(ctx context.Context, url string, headers map[string]string) (*agentClient, int, error) {
 	pr, pw := io.Pipe()
 	requestCtx, cancel := context.WithCancel(ctx)
 	// 双向请求的 io.Pipe 在上下文取消时必须主动关闭，否则 h2 写协程
@@ -59,31 +80,20 @@ func openAgentStream(ctx context.Context, url string, headers map[string]string)
 	// half-open until we close it.
 	req.ContentLength = -1
 
-	transport := &http.Transport{
-		ForceAttemptHTTP2:   true,
-		MaxConnsPerHost:     2,
-		IdleConnTimeout:     90 * time.Second,
-		TLSHandshakeTimeout: 15 * time.Second,
-		Proxy:               http.ProxyFromEnvironment,
-	}
-	client := &http.Client{Transport: transport}
-
-	resp, err := client.Do(req)
+	resp, err := agentHTTPClient.Do(req)
 	if err != nil {
 		cancel()
 		pr.Close()
 		pw.Close()
-		transport.CloseIdleConnections()
 		return nil, 0, err
 	}
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 8192))
 		resp.Body.Close()
 		cancel()
-		transport.CloseIdleConnections()
 		return nil, resp.StatusCode, fmt.Errorf("cursor AgentService %d: %s", resp.StatusCode, string(body))
 	}
-	return &agentClient{client: client, pr: pr, pw: pw, resp: resp, cancel: cancel}, resp.StatusCode, nil
+	return &agentClient{pr: pr, pw: pw, resp: resp, cancel: cancel}, resp.StatusCode, nil
 }
 
 // write sends another client frame on the run stream.
@@ -110,11 +120,6 @@ func (a *agentClient) close() {
 	}
 	if a.resp != nil {
 		a.resp.Body.Close()
-	}
-	if a.client != nil {
-		if tr, ok := a.client.Transport.(*http.Transport); ok {
-			tr.CloseIdleConnections()
-		}
 	}
 }
 
@@ -293,6 +298,9 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 			exec, _ := fieldFirst(fields, 2)
 			tool, reply, err := a.context.tools.parseExec(exec.Value)
 			if err == nil && len(reply) > 0 {
+				if kind := agentExecKind(exec.Value); kind != 36 {
+					a.stats.Load().reject(kind)
+				}
 				a.toolRejections++
 				if a.toolRejections > 16 {
 					err = fmt.Errorf("too many unsupported native tools")

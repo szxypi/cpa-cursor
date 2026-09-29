@@ -567,12 +567,35 @@ func mustAgentSingular(t *testing.T, fields []agentProtoField) map[int]agentProt
 
 func TestAgentExecUnknownFieldDoesNotExposePayload(t *testing.T) {
 	catalog := testAgentCatalog(t)
-	_, _, err := catalog.parseExec(concat(fieldVarint(1, 1), fieldBytes(99, []byte("sensitive-payload"))))
-	if err == nil {
-		t.Fatal("unknown ExecServerMessage field was accepted")
+	request, reply, err := catalog.parseExec(concat(fieldVarint(1, 1), fieldBytes(99, []byte("sensitive-payload"))))
+	if err != nil || request != nil || len(reply) == 0 {
+		t.Fatalf("unknown exec kind should get a throw reply, got request=%#v reply=%x err=%v", request, reply, err)
 	}
-	if !strings.Contains(err.Error(), "99") || strings.Contains(err.Error(), "sensitive-payload") {
-		t.Fatalf("error should name only the field, got %q", err)
+	if !bytes.Contains(reply, []byte("99")) || bytes.Contains(reply, []byte("sensitive-payload")) {
+		t.Fatalf("throw should name only the exec type, got %q", reply)
+	}
+	first := int(binary.BigEndian.Uint32(reply[1:5]))
+	outer, err := decodeAgentProto(reply[5 : 5+first])
+	if err != nil || len(outer) != 1 || outer[0].number != 5 {
+		t.Fatalf("expected AgentClientMessage.exec_client_control_message, got %#v err=%v", outer, err)
+	}
+}
+
+// Cursor 新增 ShellArgs 字段（23）和 repeated 字段（22）时仍应回复权限拒绝，而不是让整轮失败。
+func TestAgentNativeShellToleratesNewFields(t *testing.T) {
+	catalog := testAgentCatalog(t)
+	shell := concat(fieldString(1, "ls"), fieldString(22, "rm"), fieldString(22, "dd"), fieldBytes(23, fieldString(1, "new")))
+	request, reply, err := catalog.parseExec(concat(fieldVarint(1, 3), fieldBytes(2, shell)))
+	if err != nil || request != nil || len(reply) < 5 {
+		t.Fatalf("expected permission-denied reply, got request=%#v reply=%x err=%v", request, reply, err)
+	}
+	outer, err := decodeAgentProto(testAgentUnwrapFrame(t, reply))
+	if err != nil {
+		t.Fatal(err)
+	}
+	values := mustAgentSingular(t, outer)
+	if _, ok := values[2]; !ok {
+		t.Fatalf("expected ShellResult, got %#v", outer)
 	}
 }
 
