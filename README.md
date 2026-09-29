@@ -17,7 +17,7 @@
 
 - **两条上游路径**：
   - 纯文本对话（消息全是纯文本，无 tool_calls/tool 结果）→ `agent.api5.cursor.sh` 的 `AgentService/Run`。该域名只收 HTTP/2 且是**双向流**（服务端通过 `exec_request` 获取 `RequestContext.rules`，通过 KV Get/Set 获取 SHA-256 历史消息 blob；必须完整回应两类握手），宿主的 http 回调表达不了写端，所以这条路径由插件内 `net/http` 直连（ALPN 协商 h2）；它因此不进 request-log、不走宿主代理策略。
-  - 带工具定义或工具结果的对话 → 同样走 AgentService（见下方 v0.3.14 工具桥接）。`api2.cursor.sh` 的 `ChatService/StreamUnifiedChatWithTools` 现已被 Cursor 以「客户端版本过旧」拒绝，v0.3.14 起不再使用（代码保留）。
+  - 带工具定义或工具结果的对话 → 同样走 AgentService（见下方 v0.3.15–v0.3.28 工具交接）。`api2.cursor.sh` 的 `ChatService/StreamUnifiedChatWithTools` 现已被 Cursor 以「客户端版本过旧」拒绝，v0.3.14 起不再使用（代码保留）。
 - **工具语义**：assistant 历史 tool_calls 不重发；tool 结果转成 user 消息里的 `<tool_result>` XML 文本块（避免 protobuf `tool_results` 的 schema 漂移死循环）；工具定义以 MCP 形态（`mcp_custom_<name>`）下发；响应侧 tool call 从 MCP 参数恢复名称与参数。
 - **thinking**：reasoning 只对 composer 模型以「`</think>` 后内容」作为可见文本输出，其余模型不上报（无签名的 thinking 块会被 Claude Code 拒收）。
 - **用量**：Cursor 协议不回 usage，按 9router 同款 chars/4 估算填 `usage`。
@@ -64,6 +64,16 @@ machineId 省略时由 token 派生（`sha256(token+"machineId")`，与 9router 
 
 导入后模型即出现在 `/v1/models`（账号有权限的为准），用法与其它提供方一致：`model: cursor/claude-4.5-sonnet` 之类。
 
+## v0.3.15–v0.3.28 速度、用量与工具交接
+
+- **工具交接改为逐次结束上游 run**（取代 v0.3.14 的挂起流续接）：Cursor 请求 MCP 工具时，插件立即以占位结果应答（告知模型工具已交客户端执行、结束本轮），本次 run 正常结束并下发 `conversation_checkpoint_update`。客户端带回工具结果后，插件以 checkpoint 为会话状态开启新 run，只把工具结果（`<tool_result name id [is_error]>`）和其后的用户消息作为新输入，服务端不必重新处理整段历史。模型一次发起的多个工具调用会一并返回。
+- **checkpoint 复用**：以纯文本或工具调用结束的每一轮都会保存 checkpoint（含服务端 KV 写入的 blob 与 conversation_id），键为调用方身份 + 该轮请求历史哈希 + 本轮回复（文本忽略空白，含 tool_calls），30 分钟有效、仅用一次。历史被改写、工具集变化或回复不符时不复用，以完整历史重开；checkpoint run 在产生输出前失败也会自动回退。
+- **思考流**：AgentService 的 `thinking_delta` 以 `reasoning_content` 实时转发（CPA 转为 Anthropic thinking 块），模型思考期间客户端即可看到进度。流式响应在首个输出到达前缓冲（此前的错误仍以状态码返回），之后实时下发。
+- **真实用量**：输出 token 取 `token_delta` 累加；输入与缓存取 `turn_ended`。由于 `turn_ended.input_tokens` 是 run 内各步累计值，上报的 `prompt_tokens` 不超过本次请求的估算大小，`cached_tokens` 按上游真实命中比例折算，避免 Claude Code 误判上下文已满而反复自动压缩。
+- 其他：共享 h2 连接；无工具请求中模型发起的原生 IDE 操作返回拒绝而非 400；未知的原生 exec 字段以 throw 应答；非流式聚合保留 `reasoning_content` 与嵌套 usage。
+- 日志：每轮输出 `turn binding= model= mode= first_ms= total_ms= finish= native_rejects= tokens=[...] outcome=`；`mode` 为 `checkpoint` / `plain-checkpoint` / `fresh` / `fresh-history(原因)`，未命中原因如 `prefix@i/n:role`、`prefix_len:a/b`、`reply`、`tool_results`、`no_checkpoint(binding)`。
+- 实测：`TestAgentLiveToolRoundTrip` 要求第二轮起均以 checkpoint 续接；`TestAgentLiveToolFreshFallback` 每轮丢弃 checkpoint 验证完整历史回退。
+
 ## v0.3.14 AgentService 工具桥接
 
 - 调用方声明的工具以 MCP 定义下发给 Cursor；Cursor 请求 MCP 工具时，插件把它转成标准 `tool_calls` 交给客户端执行，客户端下一次请求带回 `tool` 结果后写回同一条上游 run 继续生成。插件本身不执行任何命令或文件操作。
@@ -86,6 +96,7 @@ machineId 省略时由 token 派生（`sha256(token+"machineId")`，与 9router 
 
 - token 失效只能重新导入（无服务端刷新）。
 - AgentService 直连路径绕过宿主代理与 request-log，出站代理只认进程环境变量（`HTTPS_PROXY`，本机由 systemd drop-in `10-proxy.conf` 提供）。
-- 流式请求按整轮缓冲后再下发（避免流中途出错被宿主当作凭据故障而冷却），客户端看不到逐字输出。
+- 模型收到工具占位结果后常会补一句「已提交，等待结果」之类的说明，多消耗少量输出 token。
+- checkpoint 只存在进程内存中，CPA 重启后首轮会以完整历史重开；其他插件改写旧消息时也无法复用。
 - 普通 system 指令不具备 Cursor 原生 system 的优先级（见 v0.3.13）。
 - 未实现管理面板页（`management_api` 关闭）；凭证管理走 CPA 自带的「认证文件」页即可。
