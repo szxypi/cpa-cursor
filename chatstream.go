@@ -143,7 +143,7 @@ func runAgentTurn(prepared *preparedChat, emitter *chunkEmitter) *statusError {
 		return runAgentToolBridge(prepared, emitter)
 	}
 	prepared.stats.setMode("plain")
-	if cp, text := agentCheckpoints.take(prepared); cp != nil {
+	if cp, text, _ := agentCheckpoints.take(prepared); cp != nil {
 		prepared.stats.setMode("plain-checkpoint")
 		status, emitted := runPlainAgentTurn(prepared, emitter, cp, text)
 		if status == nil || emitted {
@@ -195,7 +195,7 @@ func runPlainAgentTurn(prepared *preparedChat, emitter *chunkEmitter, cp *agentC
 		}
 		return newStatusError(http.StatusBadGateway, "upstream_error", "cursor AgentService returned no content"), emitted
 	}
-	agentCheckpoints.save(prepared, client, result.Text)
+	agentCheckpoints.save(prepared, client, agentAssistantMessage(result.Text, nil))
 	return nil, emitted
 }
 

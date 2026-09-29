@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v7/sdk/pluginapi"
 	"os"
@@ -13,10 +14,11 @@ import (
 	"testing"
 )
 
-// 仅测试客户端在隔离目录执行 Read；插件本身不得执行读文件/命令。
+// 仅测试客户端在隔离目录执行 Read；插件本身不得执行读文件/命令。每次工具调用都结束上游 run，
+// 后续请求应以 checkpoint 续接。
 func TestAgentLiveToolRoundTrip(t *testing.T) { runAgentLiveToolLoop(t, true) }
 
-// 每次工具调用后丢弃挂起会话，验证续接丢失时以完整历史重开仍能完成任务。
+// 每次都丢弃 checkpoint，验证无法续接时以完整历史重开仍能完成任务。
 func TestAgentLiveToolFreshFallback(t *testing.T) { runAgentLiveToolLoop(t, false) }
 
 func runAgentLiveToolLoop(t *testing.T, resume bool) {
@@ -43,20 +45,22 @@ func runAgentLiveToolLoop(t *testing.T, resume bool) {
 	prompt, _ := json.Marshal("Use Read to read " + path + ". Then call stamp_result with the exact marker from the file. Finally report both file marker and stamp receipt. Do not invent tool results or use shell.")
 	request := openAIRequest{Messages: []openAIMessage{{Role: "user", Content: prompt}}, Tools: []openAITool{tool, second}}
 	model := "grok-4.7-xhigh-fast"
-	var firstSession *agentBridgeSession
 	var receipt string
 	seenRead, seenStamp := false, false
-	defer pendingAgentTools.shutdown()
-	agentPayloadTap = func(payload []byte) { t.Logf("upstream %s", describeAgentPayload(payload)) }
-	defer func() { agentPayloadTap = nil }()
+	defer agentCheckpoints.reset()
 	for turn := 0; turn < 6; turn++ {
 		body, _ := json.Marshal(request)
 		prepared, status := prepareChat(rpcExecutorRequest{ExecutorRequest: pluginapi.ExecutorRequest{AuthID: "synthetic-live", Model: model, Payload: body, StorageJSON: []byte(credential)}})
 		if status != nil {
 			t.Fatal(status.Error())
 		}
+		if !resume {
+			agentCheckpoints.reset()
+		}
 		agg := newCompletionAggregator(model)
 		emitter := newChunkEmitter(model, false, false, agg.consume)
+		emitter.stats = prepared.stats
+		started := time.Now()
 		if err := runAgentToolBridge(prepared, emitter); err != nil {
 			t.Fatal(err.Error())
 		}
@@ -77,7 +81,11 @@ func runAgentLiveToolLoop(t *testing.T, resume bool) {
 			t.Fatalf("bad completion %s", response)
 		}
 		assistant := completion.Choices[0].Message
-		t.Logf("turn=%d finish=%s tool_count=%d text=%q", turn, completion.Choices[0].Reason, len(assistant.ToolCalls), contentText(assistant.Content))
+		mode, _ := prepared.stats.summary()
+		t.Logf("turn=%d mode=%s elapsed=%v finish=%s tools=%d tokens=[%s] text=%q", turn, mode, time.Since(started).Round(time.Millisecond), completion.Choices[0].Reason, len(assistant.ToolCalls), prepared.stats.tokenSummary(), contentText(assistant.Content))
+		if resume && turn > 0 && mode != "checkpoint" {
+			t.Errorf("turn %d did not continue from the checkpoint: %s", turn, mode)
+		}
 		if len(assistant.ToolCalls) == 0 {
 			answer := contentText(assistant.Content)
 			if !seenRead || !seenStamp || !strings.Contains(answer, marker) || !strings.Contains(answer, receipt) {
@@ -85,52 +93,38 @@ func runAgentLiveToolLoop(t *testing.T, resume bool) {
 			}
 			return
 		}
-		if len(assistant.ToolCalls) != 1 {
-			t.Fatal("unexpected parallel client tools")
-		}
-		tc := assistant.ToolCalls[0]
-		pendingAgentTools.mu.Lock()
-		call := pendingAgentTools.calls[tc.ID]
-		pendingAgentTools.mu.Unlock()
-		if call == nil {
-			t.Fatal("no pending call")
-		}
-		if !resume {
-			pendingAgentTools.discard(tc.ID)
-		} else if firstSession == nil {
-			firstSession = call.session
-		} else if firstSession != call.session {
-			t.Fatal("upstream run was restarted instead of resumed")
-		}
-		var args map[string]string
-		if json.Unmarshal([]byte(tc.Function.Arguments), &args) != nil {
-			t.Fatal("invalid args")
-		}
-		var result string
-		switch tc.Function.Name {
-		case "Read":
-			if args["file_path"] != path {
-				t.Fatal("attempted access outside fixture")
+		request.Messages = append(request.Messages, assistant)
+		for _, tc := range assistant.ToolCalls {
+			var args map[string]string
+			if json.Unmarshal([]byte(tc.Function.Arguments), &args) != nil {
+				t.Fatal("invalid args")
 			}
-			bytes, err := os.ReadFile(path)
-			if err != nil {
-				t.Fatal(err)
+			var result string
+			switch tc.Function.Name {
+			case "Read":
+				if args["file_path"] != path {
+					t.Fatal("attempted access outside fixture")
+				}
+				bytes, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				result = string(bytes)
+				seenRead = true
+			case "stamp_result":
+				if !seenRead || args["marker"] != marker {
+					t.Fatal("second tool did not use actual first result")
+				}
+				rand.Read(nonce[:])
+				receipt = "receipt_" + hex.EncodeToString(nonce[:])
+				result = receipt
+				seenStamp = true
+			default:
+				t.Fatalf("undeclared tool requested: %s", tc.Function.Name)
 			}
-			result = string(bytes)
-			seenRead = true
-		case "stamp_result":
-			if !seenRead || args["marker"] != marker {
-				t.Fatal("second tool did not use actual first result")
-			}
-			rand.Read(nonce[:])
-			receipt = "receipt_" + hex.EncodeToString(nonce[:])
-			result = receipt
-			seenStamp = true
-		default:
-			t.Fatalf("undeclared tool requested: %s", tc.Function.Name)
+			output, _ := json.Marshal(result)
+			request.Messages = append(request.Messages, openAIMessage{Role: "tool", ToolCallID: tc.ID, Content: output})
 		}
-		output, _ := json.Marshal(result)
-		request.Messages = append(request.Messages, assistant, openAIMessage{Role: "tool", ToolCallID: tc.ID, Content: output})
 	}
 	t.Fatal("tool loop did not complete within six turns")
 }

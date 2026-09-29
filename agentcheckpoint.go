@@ -2,6 +2,8 @@ package main
 
 import (
 	"crypto/sha256"
+	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -31,21 +33,40 @@ type agentCheckpointStore struct {
 
 var agentCheckpoints = &agentCheckpointStore{m: make(map[[32]byte]*agentCheckpoint), now: time.Now}
 
-func agentCheckpointKey(binding [32]byte, prefix []openAIMessage, assistantText string) [32]byte {
+// agentAssistantMessage 以客户端视角还原本轮回复，用于匹配客户端下一次回传的历史。
+func agentAssistantMessage(text string, calls []openAIToolCall) openAIMessage {
+	content, _ := json.Marshal(text)
+	return openAIMessage{Role: "assistant", Content: content, ToolCalls: calls}
+}
+
+func agentCheckpointKey(binding [32]byte, prefix []openAIMessage, assistant openAIMessage) [32]byte {
+	// 客户端格式转换会把工具调用前后的文字拆成多个文本块再以换行拼回，比较时忽略空白。
+	content, _ := json.Marshal(strings.Join(strings.Fields(contentText(assistant.Content)), ""))
+	normalized := openAIMessage{Role: "assistant", Content: content}
+	for _, call := range assistant.ToolCalls {
+		c := openAIToolCall{ID: call.ID, Type: "function"}
+		c.Function.Name = call.Function.Name
+		c.Function.Arguments = call.Function.Arguments
+		normalized.ToolCalls = append(normalized.ToolCalls, c)
+	}
 	history := agentHistoryHash(prefix)
+	reply := agentHistoryHash([]openAIMessage{normalized})
 	h := sha256.New()
 	h.Write(binding[:])
 	h.Write(history[:])
-	h.Write([]byte(strings.TrimSpace(assistantText)))
+	h.Write(reply[:])
 	var key [32]byte
 	copy(key[:], h.Sum(nil))
 	return key
 }
 
-// save 记录以纯文本回复结束的一轮；prefix 是该轮请求的完整历史，客户端下一条请求会在
-// 其后追加这条回复和新的用户消息。
-func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assistantText string) {
-	if p == nil || client == nil || len(client.checkpoint) == 0 || client.context == nil || strings.TrimSpace(assistantText) == "" {
+// save 记录正常结束的一轮；prefix 是该轮请求的完整历史，客户端下一次请求会在其后追加
+// 这条回复、工具结果和新的用户消息。
+func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assistant openAIMessage) {
+	if p == nil || client == nil || len(client.checkpoint) == 0 || client.context == nil {
+		return
+	}
+	if strings.TrimSpace(contentText(assistant.Content)) == "" && len(assistant.ToolCalls) == 0 {
 		return
 	}
 	blobs := make(map[string][]byte, len(client.context.blobs))
@@ -58,7 +79,7 @@ func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assist
 		conversationID: client.context.conversationID,
 		tools:          agentToolsHash(p.parsed.Tools),
 	}
-	key := agentCheckpointKey(p.binding, p.parsed.RawMessages, assistantText)
+	key := agentCheckpointKey(p.binding, p.parsed.RawMessages, assistant)
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	now := s.now()
@@ -81,36 +102,71 @@ func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assist
 	s.m[key] = cp
 }
 
-// take 取出与本次请求历史精确对应的 checkpoint，并返回需要作为新用户消息发送的文本。
-// 历史被改写、工具集变化或最后一条不是纯文本回复时返回 nil，调用方照常带完整历史重开。
-func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string) {
+// take 取出与本次请求历史精确对应的 checkpoint，并返回作为新用户消息发送的文本：上一轮
+// 交给客户端的工具结果，加上之后的用户消息。无法续接时返回原因，调用方带完整历史重开。
+func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string, string) {
 	ms := p.parsed.RawMessages
 	start := agentTrailingStart(ms)
-	if start < 1 || start == len(ms) {
-		return nil, ""
+	i := start
+	for i > 0 && ms[i-1].Role == "tool" {
+		i--
 	}
-	assistant := ms[start-1]
-	if assistant.Role != "assistant" || len(assistant.ToolCalls) > 0 {
-		return nil, ""
+	a := i - 1
+	if a < 0 {
+		return nil, "", "no_history"
+	}
+	assistant := ms[a]
+	if assistant.Role != "assistant" {
+		return nil, "", "last:" + assistant.Role
 	}
 	var texts []string
+	if len(assistant.ToolCalls) > 0 {
+		results := make(map[string]openAIMessage, start-i)
+		for _, m := range ms[i:start] {
+			results[m.ToolCallID] = m
+		}
+		if len(results) != len(assistant.ToolCalls) {
+			return nil, "", "tool_results"
+		}
+		var b strings.Builder
+		b.WriteString("Results of the tool calls handed off in the previous turn:")
+		for _, call := range assistant.ToolCalls {
+			result, ok := results[call.ID]
+			if !ok {
+				return nil, "", "tool_results"
+			}
+			status := ""
+			if p.toolErrors[call.ID] {
+				status = ` is_error="true"`
+			}
+			fmt.Fprintf(&b, "\n\n<tool_result name=%q id=%q%s>\n%s\n</tool_result>", call.Function.Name, call.ID, status, contentText(result.Content))
+		}
+		texts = append(texts, b.String())
+	} else if i != start {
+		return nil, "", "tool_results"
+	}
 	for _, m := range ms[start:] {
 		if text := strings.TrimSpace(contentText(m.Content)); text != "" {
 			texts = append(texts, text)
 		}
 	}
 	if len(texts) == 0 {
-		return nil, ""
+		return nil, "", "no_new_input"
 	}
-	key := agentCheckpointKey(p.binding, ms[:start-1], contentText(assistant.Content))
+	key := agentCheckpointKey(p.binding, ms[:a], assistant)
 	s.mu.Lock()
 	cp := s.m[key]
 	delete(s.m, key)
 	s.mu.Unlock()
-	if cp == nil || !s.now().Before(cp.expiry) || cp.tools != agentToolsHash(p.parsed.Tools) {
-		return nil, ""
+	switch {
+	case cp == nil:
+		return nil, "", "no_checkpoint"
+	case !s.now().Before(cp.expiry):
+		return nil, "", "expired"
+	case cp.tools != agentToolsHash(p.parsed.Tools):
+		return nil, "", "tools"
 	}
-	return cp, strings.Join(texts, "\n\n")
+	return cp, strings.Join(texts, "\n\n"), ""
 }
 
 // apply 让新 run 以 checkpoint 为会话状态、只发送新用户消息；本次请求的规则与工具仍由
@@ -124,4 +180,10 @@ func (cp *agentCheckpoint) apply(c *agentContext, text string) {
 	c.state = cp.state
 	c.conversationID = cp.conversationID
 	c.resumeText = text
+}
+
+func (s *agentCheckpointStore) reset() {
+	s.mu.Lock()
+	s.m = make(map[[32]byte]*agentCheckpoint)
+	s.mu.Unlock()
 }

@@ -449,24 +449,17 @@ func streamAgentTurn(prepared *preparedChat, req rpcExecutorRequest, streamID st
 		hostLog("info", fmt.Sprintf("turn model=%s mode=%s first_ms=%d total_ms=%d finish=%s native_rejects=%s tokens=[%s] outcome=%s",
 			prepared.model, mode, firstMS, time.Since(started).Milliseconds(), emitter.finish, rejects, prepared.stats.tokenSummary(), outcome))
 	}
-	discardTools := func() {
-		for _, id := range emitter.toolOrder {
-			pendingAgentTools.discard(id)
-		}
-	}
 	headers := okEnvelopeMust(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
 
 	select {
 	case status := <-done:
 		logTurn(status)
 		if status != nil {
-			discardTools()
 			return status.envelope()
 		}
 		go func() {
 			for _, chunk := range buffered {
 				if err := hostStreamEmit(streamID, chunk); err != nil {
-					discardTools()
 					hostStreamClose(streamID, err.Error())
 					return
 				}
@@ -491,10 +484,8 @@ func streamAgentTurn(prepared *preparedChat, req rpcExecutorRequest, streamID st
 		logTurn(status)
 		switch {
 		case emitErr != nil:
-			discardTools()
 			hostStreamClose(streamID, emitErr.Error())
 		case status != nil:
-			discardTools()
 			hostStreamClose(streamID, status.Error())
 		default:
 			hostStreamClose(streamID, "")

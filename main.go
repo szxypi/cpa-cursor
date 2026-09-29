@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginName    = "cpa-cursor"
-	pluginVersion = "0.3.23"
+	pluginVersion = "0.3.25"
 	providerKey   = "cursor"
 	logPrefix     = "[cpa-cursor] "
 )
@@ -136,7 +136,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 		return handleManagementRequest(request)
 
 	case pluginabi.MethodPluginShutdown:
-		pendingAgentTools.shutdown()
+		agentCheckpoints.reset()
 		return okEnvelope(map[string]any{})
 	case pluginabi.MethodPluginQuiesce:
 		return okEnvelope(map[string]any{})
@@ -147,7 +147,7 @@ func handleMethod(method string, request []byte) ([]byte, error) {
 }
 
 // shutdownEngine is invoked from the C ABI shutdown hook.
-func shutdownEngine() { pendingAgentTools.shutdown() }
+func shutdownEngine() { agentCheckpoints.reset() }
 
 // handleModelStatic reports no models: every cursor model is account-scoped
 // and arrives through model.for_auth.

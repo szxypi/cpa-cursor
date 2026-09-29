@@ -29,21 +29,21 @@ func nextTurn(p *preparedChat, assistant string, users ...string) *preparedChat 
 func TestAgentCheckpointReuseRequiresExactHistory(t *testing.T) {
 	store := &agentCheckpointStore{m: map[[32]byte]*agentCheckpoint{}, now: agentCheckpoints.now}
 	p, client := checkpointFixture()
-	store.save(p, client, "Got it.")
+	store.save(p, client, agentAssistantMessage("Got it.", nil))
 
-	if cp, _ := store.take(nextTurn(p, "Something else", "what is my cat?")); cp != nil {
+	if cp, _, _ := store.take(nextTurn(p, "Something else", "what is my cat?")); cp != nil {
 		t.Fatal("reused checkpoint although the assistant reply differs")
 	}
 	other := nextTurn(p, "Got it.", "what is my cat?")
 	other.binding = [32]byte{8}
-	if cp, _ := store.take(other); cp != nil {
+	if cp, _, _ := store.take(other); cp != nil {
 		t.Fatal("reused checkpoint across callers")
 	}
-	cp, text := store.take(nextTurn(p, "Got it.", "<system-reminder>x</system-reminder>", "what is my cat?"))
+	cp, text, _ := store.take(nextTurn(p, "Got it.", "<system-reminder>x</system-reminder>", "what is my cat?"))
 	if cp == nil || text != "<system-reminder>x</system-reminder>\n\nwhat is my cat?" {
 		t.Fatalf("checkpoint not reused: %v %q", cp, text)
 	}
-	if again, _ := store.take(nextTurn(p, "Got it.", "what is my cat?")); again != nil {
+	if again, _, _ := store.take(nextTurn(p, "Got it.", "what is my cat?")); again != nil {
 		t.Fatal("checkpoint reused twice")
 	}
 

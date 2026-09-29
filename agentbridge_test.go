@@ -1,153 +1,10 @@
 package main
 
 import (
-	"context"
 	"encoding/json"
-	"sync"
+	"strings"
 	"testing"
-	"time"
 )
-
-func testBridgeStore(t *testing.T) (*agentBridgeStore, *preparedChat, *agentBridgeSession, *agentToolRequest) {
-	t.Helper()
-	ctx, cancel := context.WithCancel(context.Background())
-	s := &agentBridgeSession{ctx: ctx, cancel: cancel, client: &agentClient{}, events: make(chan agentBridgeEvent, 8)}
-	store := &agentBridgeStore{calls: make(map[string]*agentPendingCall), now: time.Now, ttl: time.Hour, limit: 2}
-	t.Cleanup(store.shutdown)
-	t.Cleanup(s.close)
-	p := &preparedChat{binding: [32]byte{42}, parsed: &parsedChat{RawMessages: []openAIMessage{{Role: "user", Content: json.RawMessage(`"read fixture"`)}}, Tools: []cursorTool{{Name: "Read", Arguments: `{"type":"object"}`}}}}
-	tool := &agentToolRequest{Name: "Read", Arguments: `{"file_path":"fixture.txt"}`}
-	return store, p, s, tool
-}
-func toolContinuation(p *preparedChat, id string, tool *agentToolRequest, text, result string) *preparedChat {
-	raw, _ := json.Marshal(p.parsed)
-	var parsed parsedChat
-	json.Unmarshal(raw, &parsed)
-	call := openAIToolCall{ID: id, Type: "function"}
-	call.Function.Name = tool.Name
-	call.Function.Arguments = tool.Arguments
-	content, _ := json.Marshal(text)
-	output, _ := json.Marshal(result)
-	parsed.RawMessages = append(parsed.RawMessages, openAIMessage{Role: "assistant", Content: content, ToolCalls: []openAIToolCall{call}}, openAIMessage{Role: "tool", Content: output, ToolCallID: id})
-	return &preparedChat{binding: p.binding, parsed: &parsed}
-}
-func TestBridgeExactlyOnceAndReplay(t *testing.T) {
-	b, p, s, tool := testBridgeStore(t)
-	id := "call_cpa_synthetic"
-	if err := b.park(id, s, tool, p, "reading"); err != nil {
-		t.Fatal(err)
-	}
-	continuation := toolContinuation(p, id, tool, "reading", "random-result-931")
-	var wg sync.WaitGroup
-	var mu sync.Mutex
-	wins := 0
-	var winner *agentPendingCall
-	for i := 0; i < 12; i++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			call, replay, err := b.claim(id, continuation)
-			if err == nil && !replay {
-				mu.Lock()
-				wins++
-				winner = call
-				mu.Unlock()
-			}
-		}()
-	}
-	wg.Wait()
-	if wins != 1 {
-		t.Fatalf("claimed %d times", wins)
-	}
-	b.complete(winner, []agentBridgeEvent{{Text: "observed-result"}}, nil)
-	call, replay, err := b.claim(id, continuation)
-	if err != nil || !replay || call.replay[0].Text != "observed-result" {
-		t.Fatal("exact duplicate did not replay")
-	}
-	tampered := toolContinuation(p, id, tool, "reading", "different-result")
-	if _, _, err = b.claim(id, tampered); err == nil {
-		t.Fatal("changed result was replayed")
-	}
-}
-
-// 不匹配的续接一律交由调用方用完整历史重开；只有同一调用方的改写会释放旧会话，
-// 其他身份拿到相同 id 也不能影响原会话。
-func TestBridgeMismatchFallsBackWithoutCrossIdentityEffects(t *testing.T) {
-	for _, kind := range []string{"identity", "history", "tools", "arguments", "assistant", "missing_call"} {
-		t.Run(kind, func(t *testing.T) {
-			b, p, s, tool := testBridgeStore(t)
-			id := "call_cpa_guarded"
-			if err := b.park(id, s, tool, p, "reading"); err != nil {
-				t.Fatal(err)
-			}
-			next := toolContinuation(p, id, tool, "reading", "content")
-			switch kind {
-			case "identity":
-				next.binding = [32]byte{99}
-			case "history":
-				next.parsed.RawMessages[0].Content = json.RawMessage(`"different"`)
-			case "tools":
-				next.parsed.Tools[0].Name = "Bash"
-			case "arguments":
-				next.parsed.RawMessages[1].ToolCalls[0].Function.Arguments = `{"file_path":"other"}`
-			case "assistant":
-				next.parsed.RawMessages[1].Content = json.RawMessage(`"tampered"`)
-			case "missing_call":
-				next.parsed.RawMessages[1].ToolCalls = nil
-			}
-			if _, _, err := b.claim(id, next); err != errAgentContinuationLost {
-				t.Fatalf("mismatched continuation: got %v, want fresh-run fallback", err)
-			}
-			_, _, err := b.claim(id, toolContinuation(p, id, tool, "reading", "content"))
-			if kind == "identity" {
-				if err != nil || s.ctx.Err() != nil {
-					t.Fatal("another identity disturbed the pending continuation", err)
-				}
-				return
-			}
-			if err != errAgentContinuationLost || s.ctx.Err() == nil {
-				t.Fatalf("stale upstream session was kept after the caller rewrote history: err=%v", err)
-			}
-		})
-	}
-}
-func TestBridgeExpiryCapacityAndCleanup(t *testing.T) {
-	b, p, s, tool := testBridgeStore(t)
-	b.limit = 1
-	now := time.Now()
-	b.now = func() time.Time { return now }
-	if err := b.park("a", s, tool, p, ""); err != nil {
-		t.Fatal(err)
-	}
-	if err := b.park("b", s, tool, p, ""); err == nil {
-		t.Fatal("capacity exceeded")
-	}
-	now = now.Add(2 * time.Hour)
-	if _, _, err := b.claim("a", toolContinuation(p, "a", tool, "", "result")); err == nil {
-		t.Fatal("expired call accepted")
-	}
-	if s.ctx.Err() == nil {
-		t.Fatal("expired stream not cancelled")
-	}
-}
-func TestBridgeDiscardReplayDoesNotKillNewPendingTool(t *testing.T) {
-	b, p, s, tool := testBridgeStore(t)
-	if err := b.park("A", s, tool, p, ""); err != nil {
-		t.Fatal(err)
-	}
-	call, _, err := b.claim("A", toolContinuation(p, "A", tool, "", "value"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	b.complete(call, []agentBridgeEvent{{ID: "B", Tool: tool}}, nil)
-	if err := b.park("B", s, tool, p, ""); err != nil {
-		t.Fatal(err)
-	}
-	b.discard("A")
-	if s.ctx.Err() != nil || b.calls["B"] == nil {
-		t.Fatal("discarding completed replay killed later pending call")
-	}
-}
 
 func TestOriginalToolErrorPreserved(t *testing.T) {
 	got := originalToolErrors([]byte(`{"messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call_x","is_error":true,"content":"denied"}]}]}`))
@@ -156,24 +13,54 @@ func TestOriginalToolErrorPreserved(t *testing.T) {
 	}
 }
 
-// 工具结果之后附带的用户消息（如 system-reminder）不能阻断续接，且要随结果一起回传给上游。
-func TestBridgeResumesWithTrailingUserMessages(t *testing.T) {
-	b, p, s, tool := testBridgeStore(t)
-	id := "call_cpa_trailing"
-	if err := b.park(id, s, tool, p, "reading"); err != nil {
-		t.Fatal(err)
+func toolCallFixture(id, name, args string) openAIToolCall {
+	call := openAIToolCall{ID: id, Type: "function"}
+	call.Function.Name = name
+	call.Function.Arguments = args
+	return call
+}
+
+// 交给客户端的工具调用结束后，客户端回传的工具结果（含附带的提醒消息）要命中同一 checkpoint，
+// 并作为新用户消息发送；参数的 JSON 格式差异不影响匹配。
+func TestCheckpointResumesWithHandedOffToolResults(t *testing.T) {
+	store := &agentCheckpointStore{m: map[[32]byte]*agentCheckpoint{}, now: agentCheckpoints.now}
+	p, client := checkpointFixture()
+	p.toolErrors = map[string]bool{"call_cpa_b": true}
+	calls := []openAIToolCall{toolCallFixture("call_cpa_a", "Read", `{"file_path":"a.txt"}`), toolCallFixture("call_cpa_b", "Bash", `{"command":"ls"}`)}
+	store.save(p, client, agentAssistantMessage("checking.Done", calls))
+
+	echoed := []openAIToolCall{toolCallFixture("call_cpa_a", "Read", `{ "file_path" : "a.txt" }`), calls[1]}
+	next := &preparedChat{binding: p.binding, toolErrors: p.toolErrors, parsed: &parsedChat{Tools: p.parsed.Tools, RawMessages: append(append([]openAIMessage(nil), p.parsed.RawMessages...),
+		openAIMessage{Role: "assistant", Content: json.RawMessage(`[{"type":"text","text":"checking."},{"type":"text","text":"Done"}]`), ToolCalls: echoed},
+		openAIMessage{Role: "tool", ToolCallID: "call_cpa_b", Content: json.RawMessage(`"permission denied"`)},
+		openAIMessage{Role: "tool", ToolCallID: "call_cpa_a", Content: json.RawMessage(`"alpha"`)},
+		openAIMessage{Role: "user", Content: json.RawMessage(`"<system-reminder>r</system-reminder>"`)},
+	)}}
+	cp, text, miss := store.take(next)
+	if cp == nil {
+		t.Fatalf("checkpoint not reused: %s", miss)
 	}
-	next := toolContinuation(p, id, tool, "reading", "fixture-body")
-	next.parsed.RawMessages = append(next.parsed.RawMessages, openAIMessage{Role: "user", Content: json.RawMessage(`"reminder-77"`)})
-	if _, _, err := b.claim(id, next); err != nil {
-		t.Fatalf("trailing user message blocked resume: %v", err)
+	for _, want := range []string{`<tool_result name="Read" id="call_cpa_a">` + "\nalpha\n", `<tool_result name="Bash" id="call_cpa_b" is_error="true">` + "\npermission denied\n", "<system-reminder>r</system-reminder>"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("resume text missing %q:\n%s", want, text)
+		}
 	}
-	ms := next.parsed.RawMessages
-	last := agentTrailingStart(ms) - 1
-	if last != len(ms)-2 {
-		t.Fatalf("tool result index = %d", last)
+	if strings.Index(text, "call_cpa_a") > strings.Index(text, "call_cpa_b") {
+		t.Fatal("tool results must follow the assistant's call order")
 	}
-	if got := agentResumeText(ms, last); got != "fixture-body\n\n<user_message>\nreminder-77\n</user_message>" {
-		t.Fatalf("resume text = %q", got)
+}
+
+// 缺少任何一个工具结果时不能续接，否则上游会把占位结果当成真实结果。
+func TestCheckpointRequiresEveryToolResult(t *testing.T) {
+	store := &agentCheckpointStore{m: map[[32]byte]*agentCheckpoint{}, now: agentCheckpoints.now}
+	p, client := checkpointFixture()
+	calls := []openAIToolCall{toolCallFixture("call_cpa_a", "Read", `{}`), toolCallFixture("call_cpa_b", "Read", `{}`)}
+	store.save(p, client, agentAssistantMessage("", calls))
+	next := &preparedChat{binding: p.binding, parsed: &parsedChat{Tools: p.parsed.Tools, RawMessages: append(append([]openAIMessage(nil), p.parsed.RawMessages...),
+		openAIMessage{Role: "assistant", ToolCalls: calls},
+		openAIMessage{Role: "tool", ToolCallID: "call_cpa_a", Content: json.RawMessage(`"alpha"`)},
+	)}}
+	if cp, _, miss := store.take(next); cp != nil || miss != "tool_results" {
+		t.Fatalf("partial tool results reused checkpoint (miss=%q)", miss)
 	}
 }
