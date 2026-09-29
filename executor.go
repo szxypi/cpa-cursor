@@ -281,8 +281,16 @@ func (e *chunkEmitter) finishChunk(promptChars int) error {
 	}
 	prompt, completion := estimateTokensLen(promptChars), estimateTokensLen(e.outputChars)
 	in, out, cacheRead, hasIn, hasOut := e.stats.usage()
+	cached := 0
 	if hasIn {
-		prompt = int(in)
+		// Cursor 的 input_tokens 是本次 run 内每一步读取上下文的累计值（交接工具调用时至少
+		// 两步），远大于客户端的实际上下文；客户端据此判断何时压缩上下文，所以不能超过本次
+		// 请求的估算大小，缓存数按上游真实命中比例折算。
+		prompt, cached = int(in), int(cacheRead)
+		if est := estimateTokensLen(promptChars); est > 0 && prompt > est {
+			cached = int(int64(est) * cacheRead / in)
+			prompt = est
+		}
 	}
 	if hasOut && int(out) > completion {
 		completion = int(out)
@@ -292,8 +300,8 @@ func (e *chunkEmitter) finishChunk(promptChars int) error {
 		"completion_tokens": completion,
 		"total_tokens":      prompt + completion,
 	}
-	if hasIn && cacheRead > 0 {
-		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cacheRead}
+	if cached > 0 {
+		usage["prompt_tokens_details"] = map[string]any{"cached_tokens": cached}
 	}
 	chunk := e.baseChunk(map[string]any{})
 	choices := chunk["choices"].([]any)
@@ -446,8 +454,8 @@ func streamAgentTurn(prepared *preparedChat, req rpcExecutorRequest, streamID st
 		mu.Lock()
 		firstMS := firstAt.Milliseconds()
 		mu.Unlock()
-		hostLog("info", fmt.Sprintf("turn model=%s mode=%s first_ms=%d total_ms=%d finish=%s native_rejects=%s tokens=[%s] outcome=%s",
-			prepared.model, mode, firstMS, time.Since(started).Milliseconds(), emitter.finish, rejects, prepared.stats.tokenSummary(), outcome))
+		hostLog("info", fmt.Sprintf("turn binding=%x model=%s mode=%s first_ms=%d total_ms=%d finish=%s native_rejects=%s tokens=[%s] outcome=%s",
+			prepared.binding[:4], prepared.model, mode, firstMS, time.Since(started).Milliseconds(), emitter.finish, rejects, prepared.stats.tokenSummary(), outcome))
 	}
 	headers := okEnvelopeMust(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
 

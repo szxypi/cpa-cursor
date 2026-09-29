@@ -23,6 +23,10 @@ type agentCheckpoint struct {
 	conversationID string
 	tools          [32]byte
 	expiry         time.Time
+	// 以下仅用于诊断未命中原因，不参与匹配。
+	binding  [32]byte
+	messages [][32]byte
+	reply    [32]byte
 }
 
 type agentCheckpointStore struct {
@@ -63,9 +67,14 @@ func agentCheckpointKey(binding [32]byte, prefix []openAIMessage, assistant open
 // save 记录正常结束的一轮；prefix 是该轮请求的完整历史，客户端下一次请求会在其后追加
 // 这条回复、工具结果和新的用户消息。
 func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assistant openAIMessage) {
-	if p == nil || client == nil || len(client.checkpoint) == 0 || client.context == nil {
+	if p == nil || client == nil || client.context == nil {
 		return
 	}
+	if len(client.checkpoint) == 0 {
+		p.stats.setCheckpoint("none")
+		return
+	}
+	p.stats.setCheckpoint("saved")
 	if strings.TrimSpace(contentText(assistant.Content)) == "" && len(assistant.ToolCalls) == 0 {
 		return
 	}
@@ -78,6 +87,9 @@ func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assist
 		blobs:          blobs,
 		conversationID: client.context.conversationID,
 		tools:          agentToolsHash(p.parsed.Tools),
+		binding:        p.binding,
+		messages:       agentMessageHashes(p.parsed.RawMessages),
+		reply:          agentCheckpointKey([32]byte{}, nil, assistant),
 	}
 	key := agentCheckpointKey(p.binding, p.parsed.RawMessages, assistant)
 	s.mu.Lock()
@@ -160,7 +172,7 @@ func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string, 
 	s.mu.Unlock()
 	switch {
 	case cp == nil:
-		return nil, "", "no_checkpoint"
+		return nil, "", s.diagnose(p.binding, ms[:a], assistant)
 	case !s.now().Before(cp.expiry):
 		return nil, "", "expired"
 	case cp.tools != agentToolsHash(p.parsed.Tools):
@@ -186,4 +198,50 @@ func (s *agentCheckpointStore) reset() {
 	s.mu.Lock()
 	s.m = make(map[[32]byte]*agentCheckpoint)
 	s.mu.Unlock()
+}
+
+func agentMessageHashes(ms []openAIMessage) [][32]byte {
+	out := make([][32]byte, len(ms))
+	for i := range ms {
+		out[i] = agentHistoryHash(ms[i : i+1])
+	}
+	return out
+}
+
+// diagnose 在同一调用方的 checkpoint 中找与本次历史最接近的一条，说明未命中的位置：
+// prefix@i:role 表示第 i 条历史被改写，reply 表示上一条回复与交付内容不同。
+func (s *agentCheckpointStore) diagnose(binding [32]byte, prefix []openAIMessage, assistant openAIMessage) string {
+	current := agentMessageHashes(prefix)
+	reply := agentCheckpointKey([32]byte{}, nil, assistant)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	best, reason := -1, "no_checkpoint"
+	for _, cp := range s.m {
+		if cp.binding != binding {
+			continue
+		}
+		n := 0
+		for n < len(cp.messages) && n < len(current) && cp.messages[n] == current[n] {
+			n++
+		}
+		if n <= best {
+			continue
+		}
+		best = n
+		switch {
+		case n == len(cp.messages) && n == len(current):
+			reason = "reply"
+			if cp.reply == reply {
+				reason = "reply_same"
+			}
+		case n < len(cp.messages) && n < len(current):
+			reason = fmt.Sprintf("prefix@%d/%d:%s", n, len(current), prefix[n].Role)
+		default:
+			reason = fmt.Sprintf("prefix_len:%d/%d", len(current), len(cp.messages))
+		}
+	}
+	if best < 0 {
+		return "no_checkpoint(binding)"
+	}
+	return reason
 }

@@ -340,12 +340,22 @@ type agentTurnStats struct {
 	rejects map[int]int
 	// outTokens 累加 token_delta，是本 HTTP 轮次实际生成的 token；ended 之后的字段来自
 	// Cursor turn_ended，是整个上游 run 的累计值。
+	checkpoint string
 	outTokens  int64
 	ended      bool
 	inTokens   int64
 	cacheRead  int64
 	cacheWrite int64
 	reasoning  int64
+}
+
+func (s *agentTurnStats) setCheckpoint(v string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.checkpoint = v
+	s.mu.Unlock()
 }
 
 func (s *agentTurnStats) addOutputTokens(n int64) {
@@ -436,6 +446,9 @@ func (s *agentTurnStats) summary() (string, string) {
 	mode := s.mode
 	if s.miss != "" && strings.HasPrefix(mode, "fresh") {
 		mode += "(" + s.miss + ")"
+	}
+	if s.checkpoint != "" {
+		mode += " cp=" + s.checkpoint
 	}
 	return mode, strings.Join(kinds, ",")
 }

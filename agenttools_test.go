@@ -765,7 +765,7 @@ func TestAgentUsageFromUpstream(t *testing.T) {
 		}
 		return nil
 	}
-	if err := emitter.finishChunk(10); err != nil {
+	if err := emitter.finishChunk(1 << 20); err != nil {
 		t.Fatal(err)
 	}
 	_ = out
@@ -801,7 +801,7 @@ func TestAgentThinkingForwardedAndAggregated(t *testing.T) {
 	if err := emitter.textDelta("answer"); err != nil {
 		t.Fatal(err)
 	}
-	if err := emitter.finishChunk(10); err != nil {
+	if err := emitter.finishChunk(1000); err != nil {
 		t.Fatal(err)
 	}
 	raw, err := agg.completion()
@@ -824,5 +824,35 @@ func TestAgentThinkingForwardedAndAggregated(t *testing.T) {
 	m := out.Choices[0].Message
 	if m.Content != "answer" || m.Reasoning != "pondering" || out.Usage["prompt_tokens"] != float64(50) || out.Usage["prompt_tokens_details"] == nil {
 		t.Fatalf("completion = %s", raw)
+	}
+}
+
+// Cursor 报告的是 run 内各步累计输入；上报给客户端的上下文不能超过请求本身，否则客户端会
+// 反复触发自动压缩。缓存比例保持上游真实值。
+func TestAgentUsageCappedToRequestSize(t *testing.T) {
+	var last []byte
+	emitter := newChunkEmitter("m", false, false, func(b []byte) error {
+		if string(b) != "[DONE]" {
+			last = append([]byte(nil), b...)
+		}
+		return nil
+	})
+	emitter.stats = &agentTurnStats{ended: true, inTokens: 200000, cacheRead: 180000, outTokens: 5}
+	if err := emitter.finishChunk(400000); err != nil {
+		t.Fatal(err)
+	}
+	var chunk struct {
+		Usage struct {
+			Prompt  int `json:"prompt_tokens"`
+			Details struct {
+				Cached int `json:"cached_tokens"`
+			} `json:"prompt_tokens_details"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal(last, &chunk); err != nil {
+		t.Fatal(err)
+	}
+	if chunk.Usage.Prompt != 100000 || chunk.Usage.Details.Cached != 90000 {
+		t.Fatalf("usage = %+v", chunk.Usage)
 	}
 }
