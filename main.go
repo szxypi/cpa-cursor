@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginName    = "cpa-cursor"
-	pluginVersion = "0.3.28"
+	pluginVersion = "0.3.32"
 	providerKey   = "cursor"
 	logPrefix     = "[cpa-cursor] "
 )
@@ -102,6 +102,7 @@ func pluginRegistration() registration {
 func handleMethod(method string, request []byte) ([]byte, error) {
 	switch method {
 	case pluginabi.MethodPluginRegister, pluginabi.MethodPluginReconfigure:
+		agentCheckpoints.enableDisk()
 		if err := configure(request); err != nil {
 			return nil, err
 		}

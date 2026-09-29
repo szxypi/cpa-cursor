@@ -192,7 +192,7 @@ func startAgentBridge(p *preparedChat, cp *agentCheckpoint, resumeText string) (
 				return err
 			}
 		}
-		return client.write(tool.resultFrame(agentToolHandoffMessage, false))
+		return client.write(tool.handoffFrame())
 	}
 	frame := buildAgentRunFrame(p.parsed.Messages, p.model, state)
 	go func() {
@@ -245,6 +245,7 @@ func consumeAgentBridge(s *agentBridgeSession, p *preparedChat, emitter *chunkEm
 	var delivered []agentBridgeEvent
 	var text strings.Builder
 	var calls []openAIToolCall
+	handedOff := false
 	for {
 		select {
 		case <-s.ctx.Done():
@@ -266,10 +267,16 @@ func consumeAgentBridge(s *agentBridgeSession, p *preparedChat, emitter *chunkEm
 				agentCheckpoints.save(p, s.client, agentAssistantMessage(text.String(), calls))
 				return delivered, nil
 			}
+			// 工具交接后模型收到的是占位结果，其后的文字多为「已提交、等待结果」之类的说明，
+			// 不转发给客户端；checkpoint 的回复文本也只含交付给客户端的部分，保证下一轮能匹配。
+			if handedOff && e.Tool == nil {
+				continue
+			}
 			if e.Text != "" {
 				text.WriteString(e.Text)
 			}
 			if e.Tool != nil {
+				handedOff = true
 				call := openAIToolCall{ID: e.ID, Type: "function"}
 				call.Function.Name = e.Tool.Name
 				call.Function.Arguments = e.Tool.Arguments
@@ -307,7 +314,7 @@ func hasAgentToolResult(messages []openAIMessage) bool {
 func runAgentToolBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 	cp, text, miss := agentCheckpoints.take(p)
 	if cp != nil {
-		p.stats.setMode("checkpoint")
+		p.stats.setMode("checkpoint" + miss)
 		session, status := startAgentBridge(p, cp, text)
 		if status == nil {
 			var delivered []agentBridgeEvent
@@ -338,6 +345,7 @@ type agentTurnStats struct {
 	mode    string
 	miss    string
 	rejects map[int]int
+	mapped  map[int]int
 	// outTokens 累加 token_delta，是本 HTTP 轮次实际生成的 token；ended 之后的字段来自
 	// Cursor turn_ended，是整个上游 run 的累计值。
 	checkpoint string
@@ -347,6 +355,32 @@ type agentTurnStats struct {
 	cacheRead  int64
 	cacheWrite int64
 	reasoning  int64
+}
+
+func (s *agentTurnStats) mapNative(kind int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	if s.mapped == nil {
+		s.mapped = make(map[int]int)
+	}
+	s.mapped[kind]++
+	s.mu.Unlock()
+}
+
+func (s *agentTurnStats) mappedSummary() string {
+	if s == nil {
+		return ""
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	kinds := make([]string, 0, len(s.mapped))
+	for kind, count := range s.mapped {
+		kinds = append(kinds, fmt.Sprintf("%d:%d", kind, count))
+	}
+	sort.Strings(kinds)
+	return strings.Join(kinds, ",")
 }
 
 func (s *agentTurnStats) setCheckpoint(v string) {

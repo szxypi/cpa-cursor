@@ -64,6 +64,14 @@ machineId 省略时由 token 派生（`sha256(token+"machineId")`，与 9router 
 
 导入后模型即出现在 `/v1/models`（账号有权限的为准），用法与其它提供方一致：`model: cursor/claude-4.5-sonnet` 之类。
 
+## v0.3.29–v0.3.32 原生工具转交、宽松续接与 checkpoint 落盘
+
+- **原生工具转交客户端**：Cursor 自带的 Shell（exec 2/14）、Grep（5）、Write（3，二进制除外）在调用方声明了 schema 兼容的同类工具时，转成 `Bash`/`Grep`/`Write`（或小写同名）的 `tool_calls` 交客户端执行，上游收到原生结果类型的「已转交」占位后结束本轮。Shell 的工作目录以 `cd '<dir>' &&` 前缀保留；只声明了 Bash 时，Grep 还原为等价的 `rg` 命令交给 Bash。参数无法一一对应时仍返回权限拒绝，并记录 `native reject kind= candidates=` 便于排查。
+- **宽松续接**：上游中间件（如上下文分页、输出压缩）改写旧的 user/tool/system 文本会让严格哈希失配。现在消息条数、角色、工具调用 ID 一致且 assistant 消息与最终回复完全相同时，仍以 checkpoint 续接（日志 `mode=checkpoint-relaxed`）；checkpoint 保存的是改写前的完整内容。
+- **交接后不再转发说明文字**：同一 run 中首个工具调用之后的文字和思考（多为「已提交、等待结果」）不再下发给客户端，也不计入 checkpoint 的回复匹配。
+- **checkpoint 落盘**：保存到服务目录下的 `cpa-cursor/checkpoints/`（目录 0700、文件 0600，含会话内容），启动时载入未过期项，使用后删除，超过 30 分钟清理；CPA 重启或部署后可继续续接。
+- 日志新增 `native_mapped=kind:count`；未命中原因 `prefix@i/n:role:lenA>B[:reminder]` 给出被改写消息的前后长度；非流式请求同样输出 `turn` 日志。
+
 ## v0.3.15–v0.3.28 速度、用量与工具交接
 
 - **工具交接改为逐次结束上游 run**（取代 v0.3.14 的挂起流续接）：Cursor 请求 MCP 工具时，插件立即以占位结果应答（告知模型工具已交客户端执行、结束本轮），本次 run 正常结束并下发 `conversation_checkpoint_update`。客户端带回工具结果后，插件以 checkpoint 为会话状态开启新 run，只把工具结果（`<tool_result name id [is_error]>`）和其后的用户消息作为新输入，服务端不必重新处理整段历史。模型一次发起的多个工具调用会一并返回。
@@ -96,7 +104,8 @@ machineId 省略时由 token 派生（`sha256(token+"machineId")`，与 9router 
 
 - token 失效只能重新导入（无服务端刷新）。
 - AgentService 直连路径绕过宿主代理与 request-log，出站代理只认进程环境变量（`HTTPS_PROXY`，本机由 systemd drop-in `10-proxy.conf` 提供）。
-- 模型收到工具占位结果后常会补一句「已提交，等待结果」之类的说明，多消耗少量输出 token。
-- checkpoint 只存在进程内存中，CPA 重启后首轮会以完整历史重开；其他插件改写旧消息时也无法复用。
+- 模型收到工具占位结果后仍可能在上游补一句说明（不再转发给客户端），会多消耗少量输出 token。
+- 历史被截断、压缩为更少条数（如 `/compact`）或 assistant 消息被改写时无法续接，以完整历史重开。
+- Cursor 原生 Delete、Ls、Diagnostics 等仍返回权限拒绝，由模型改用声明的工具。
 - 普通 system 指令不具备 Cursor 原生 system 的优先级（见 v0.3.13）。
 - 未实现管理面板页（`management_api` 关闭）；凭证管理走 CPA 自带的「认证文件」页即可。

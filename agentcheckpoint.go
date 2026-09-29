@@ -23,16 +23,19 @@ type agentCheckpoint struct {
 	conversationID string
 	tools          [32]byte
 	expiry         time.Time
+	binding        [32]byte
+	shapes         [][32]byte
+	reply          [32]byte
 	// 以下仅用于诊断未命中原因，不参与匹配。
-	binding  [32]byte
 	messages [][32]byte
-	reply    [32]byte
+	lengths  []int
 }
 
 type agentCheckpointStore struct {
-	mu  sync.Mutex
-	m   map[[32]byte]*agentCheckpoint
-	now func() time.Time
+	mu   sync.Mutex
+	m    map[[32]byte]*agentCheckpoint
+	now  func() time.Time
+	disk string
 }
 
 var agentCheckpoints = &agentCheckpointStore{m: make(map[[32]byte]*agentCheckpoint), now: time.Now}
@@ -89,6 +92,8 @@ func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assist
 		tools:          agentToolsHash(p.parsed.Tools),
 		binding:        p.binding,
 		messages:       agentMessageHashes(p.parsed.RawMessages),
+		lengths:        agentMessageLengths(p.parsed.RawMessages),
+		shapes:         agentMessageShapes(p.parsed.RawMessages),
 		reply:          agentCheckpointKey([32]byte{}, nil, assistant),
 	}
 	key := agentCheckpointKey(p.binding, p.parsed.RawMessages, assistant)
@@ -112,10 +117,14 @@ func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assist
 		delete(s.m, oldest)
 	}
 	s.m[key] = cp
+	if s.disk != "" {
+		go s.persist(s.disk, key, cp)
+	}
 }
 
-// take 取出与本次请求历史精确对应的 checkpoint，并返回作为新用户消息发送的文本：上一轮
-// 交给客户端的工具结果，加上之后的用户消息。无法续接时返回原因，调用方带完整历史重开。
+// take 取出与本次请求历史对应的 checkpoint，并返回作为新用户消息发送的文本：上一轮
+// 交给客户端的工具结果，加上之后的用户消息。无法续接时返回原因，调用方带完整历史重开；
+// 以宽松匹配命中时第三个返回值为 "-relaxed"。
 func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string, string) {
 	ms := p.parsed.RawMessages
 	start := agentTrailingStart(ms)
@@ -169,6 +178,20 @@ func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string, 
 	s.mu.Lock()
 	cp := s.m[key]
 	delete(s.m, key)
+	relaxed := ""
+	if cp == nil {
+		if k, found := s.findRelaxed(p.binding, ms[:a], assistant); found != nil {
+			cp, relaxed = found, "-relaxed"
+			delete(s.m, k)
+		}
+	}
+	if s.disk != "" {
+		if cp == nil {
+			cp = s.loadDisk(s.disk, key)
+		} else {
+			s.removeDisk(s.disk, key)
+		}
+	}
 	s.mu.Unlock()
 	switch {
 	case cp == nil:
@@ -178,7 +201,44 @@ func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string, 
 	case cp.tools != agentToolsHash(p.parsed.Tools):
 		return nil, "", "tools"
 	}
-	return cp, strings.Join(texts, "\n\n"), ""
+	return cp, strings.Join(texts, "\n\n"), relaxed
+}
+
+// findRelaxed 容忍上游中间件（如上下文分页、输出压缩）改写旧的 user/tool/system 文本：
+// 消息条数、角色、工具调用 ID 必须一致，assistant 消息与最终回复必须完全相同。
+// checkpoint 保存的是改写前的完整内容，续接不会丢失信息。调用方须持有 s.mu。
+func (s *agentCheckpointStore) findRelaxed(binding [32]byte, prefix []openAIMessage, assistant openAIMessage) ([32]byte, *agentCheckpoint) {
+	shapes := agentMessageShapes(prefix)
+	reply := agentCheckpointKey([32]byte{}, nil, assistant)
+	for k, cp := range s.m {
+		if cp.binding != binding || cp.reply != reply || len(cp.shapes) != len(shapes) {
+			continue
+		}
+		same := true
+		for i := range shapes {
+			if cp.shapes[i] != shapes[i] {
+				same = false
+				break
+			}
+		}
+		if same {
+			return k, cp
+		}
+	}
+	return [32]byte{}, nil
+}
+
+// agentMessageShapes 为每条消息取结构指纹：assistant 取完整内容，其余只取角色与工具调用 ID。
+func agentMessageShapes(ms []openAIMessage) [][32]byte {
+	out := make([][32]byte, len(ms))
+	for i, m := range ms {
+		if m.Role == "assistant" {
+			out[i] = agentHistoryHash(ms[i : i+1])
+			continue
+		}
+		out[i] = sha256.Sum256([]byte(m.Role + "\x00" + m.ToolCallID))
+	}
+	return out
 }
 
 // apply 让新 run 以 checkpoint 为会话状态、只发送新用户消息；本次请求的规则与工具仍由
@@ -198,6 +258,14 @@ func (s *agentCheckpointStore) reset() {
 	s.mu.Lock()
 	s.m = make(map[[32]byte]*agentCheckpoint)
 	s.mu.Unlock()
+}
+
+func agentMessageLengths(ms []openAIMessage) []int {
+	out := make([]int, len(ms))
+	for i, m := range ms {
+		out[i] = len(contentText(m.Content))
+	}
+	return out
 }
 
 func agentMessageHashes(ms []openAIMessage) [][32]byte {
@@ -235,7 +303,11 @@ func (s *agentCheckpointStore) diagnose(binding [32]byte, prefix []openAIMessage
 				reason = "reply_same"
 			}
 		case n < len(cp.messages) && n < len(current):
-			reason = fmt.Sprintf("prefix@%d/%d:%s", n, len(current), prefix[n].Role)
+			text := contentText(prefix[n].Content)
+			reason = fmt.Sprintf("prefix@%d/%d:%s:len%d>%d", n, len(current), prefix[n].Role, cp.lengths[n], len(text))
+			if strings.Contains(text, "<system-reminder>") {
+				reason += ":reminder"
+			}
 		default:
 			reason = fmt.Sprintf("prefix_len:%d/%d", len(current), len(cp.messages))
 		}

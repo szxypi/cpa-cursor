@@ -376,14 +376,19 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 		return statusErr.envelope(), nil
 	}
 
+	started := time.Now()
 	aggregator := newCompletionAggregator(prepared.clientModel)
 	emitter := newChunkEmitter(prepared.clientModel, isComposerModel(prepared.model), false, aggregator.consume)
 	emitter.stats = prepared.stats
-	if err := runPrepared(prepared, req.HostCallbackID, emitter); err != nil {
-		return err.envelope(), nil
+	status := runPrepared(prepared, req.HostCallbackID, emitter)
+	if status == nil {
+		if err := emitter.finishChunk(prepared.parsed.InputChars); err != nil {
+			status = asStatusError(err, http.StatusBadGateway, "upstream_error")
+		}
 	}
-	if err := emitter.finishChunk(prepared.parsed.InputChars); err != nil {
-		return asStatusError(err, http.StatusBadGateway, "upstream_error").envelope(), nil
+	logAgentTurn(prepared, emitter, started, 0, status)
+	if status != nil {
+		return status.envelope(), nil
 	}
 	payload, err := aggregator.completion()
 	if err != nil {
@@ -393,6 +398,16 @@ func handleExecutorExecute(request []byte) ([]byte, error) {
 		Payload: payload,
 		Headers: http.Header{"Content-Type": []string{"application/json"}},
 	})
+}
+
+func logAgentTurn(prepared *preparedChat, emitter *chunkEmitter, started time.Time, first time.Duration, status *statusError) {
+	mode, rejects := prepared.stats.summary()
+	outcome := "ok"
+	if status != nil {
+		outcome = fmt.Sprintf("%d %s", status.status, status.message)
+	}
+	hostLog("info", fmt.Sprintf("turn binding=%x model=%s mode=%s first_ms=%d total_ms=%d finish=%s native_rejects=%s native_mapped=%s tokens=[%s] outcome=%s",
+		prepared.binding[:4], prepared.model, mode, first.Milliseconds(), time.Since(started).Milliseconds(), emitter.finish, rejects, prepared.stats.mappedSummary(), prepared.stats.tokenSummary(), outcome))
 }
 
 // runPrepared drives the upstream call and feeds the emitter; the returned
@@ -446,16 +461,10 @@ func streamAgentTurn(prepared *preparedChat, req rpcExecutorRequest, streamID st
 		done <- status
 	}()
 	logTurn := func(status *statusError) {
-		mode, rejects := prepared.stats.summary()
-		outcome := "ok"
-		if status != nil {
-			outcome = fmt.Sprintf("%d %s", status.status, status.message)
-		}
 		mu.Lock()
-		firstMS := firstAt.Milliseconds()
+		first := firstAt
 		mu.Unlock()
-		hostLog("info", fmt.Sprintf("turn binding=%x model=%s mode=%s first_ms=%d total_ms=%d finish=%s native_rejects=%s tokens=[%s] outcome=%s",
-			prepared.binding[:4], prepared.model, mode, firstMS, time.Since(started).Milliseconds(), emitter.finish, rejects, prepared.stats.tokenSummary(), outcome))
+		logAgentTurn(prepared, emitter, started, first, status)
 	}
 	headers := okEnvelopeMust(map[string]any{"headers": http.Header{"Content-Type": []string{"text/event-stream"}}})
 

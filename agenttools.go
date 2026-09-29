@@ -51,6 +51,17 @@ type agentToolRequest struct {
 	nativeRead      bool
 	nativePath      string
 	nativeOffsetSet bool
+	// handoff 是原生工具被映射到客户端工具时回给上游的即时结果；MCP 调用为 nil。
+	handoff []byte
+}
+
+// handoffFrame 返回交接时回给上游的即时结果：原生工具用其自身结果类型说明已转交，
+// MCP 工具用占位的成功结果。
+func (r *agentToolRequest) handoffFrame() []byte {
+	if r.handoff != nil {
+		return r.handoff
+	}
+	return r.resultFrame(agentToolHandoffMessage, false)
 }
 
 // newAgentToolCatalog 校验工具 schema，并按 Cursor 的 google.protobuf.Value 编码生成目录。
@@ -215,10 +226,14 @@ func (c *agentToolCatalog) parseExec(exec []byte) (*agentToolRequest, []byte, er
 		if request, ok, err := c.mapNativeRead(id, execID, hasExecID, nativeArgs); err != nil {
 			return nil, nil, err
 		} else if ok {
+			request.handoff = nativeToolRejectionFrame(id, execID, hasExecID, *execField, agentNativeHandoffMessage(request.Name))
 			return request, nil, nil
 		}
 	}
-	if frame := nativeToolRejectionFrame(id, execID, hasExecID, *execField); frame != nil {
+	if request := c.mapNativeExec(id, execID, hasExecID, *execField, nativeArgs); request != nil {
+		return request, nil, nil
+	}
+	if frame := nativeToolRejectionFrame(id, execID, hasExecID, *execField, agentToolPermissionMessage); frame != nil {
 		return nil, frame, nil
 	}
 	return nil, agentExecThrowFrames(id, agentToolPermissionMessage), nil
@@ -521,6 +536,10 @@ func agentSchemaTypesAccept(schema map[string]any, arguments map[string]any) boo
 			_ = parsed
 		case "number":
 			if _, ok := value.(json.Number); !ok {
+				return false
+			}
+		case "boolean":
+			if _, ok := value.(bool); !ok {
 				return false
 			}
 		default:
@@ -947,7 +966,8 @@ func agentToolString(fields map[int]agentProtoField, number int) string {
 	return ""
 }
 
-func nativeToolRejectionFrame(id uint32, execID string, hasExecID bool, request agentProtoField) []byte {
+// nativeToolRejectionFrame 以原生工具自身的拒绝/错误结果应答，reason 为给模型看的说明。
+func nativeToolRejectionFrame(id uint32, execID string, hasExecID bool, request agentProtoField, reason string) []byte {
 	var resultField int
 	var result []byte
 	path, command, workingDirectory := "", "", ""
@@ -982,28 +1002,28 @@ func nativeToolRejectionFrame(id uint32, execID string, hasExecID bool, request 
 	switch request.number {
 	case 2: // ShellResult.permission_denied
 		resultField = 2
-		result = fieldBytes(7, concat(fieldString(1, command), fieldString(2, workingDirectory), fieldString(3, agentToolPermissionMessage)))
+		result = fieldBytes(7, concat(fieldString(1, command), fieldString(2, workingDirectory), fieldString(3, reason)))
 	case 14: // ShellStream.permission_denied
 		resultField = 14
-		result = fieldBytes(6, concat(fieldString(1, command), fieldString(2, workingDirectory), fieldString(3, agentToolPermissionMessage)))
+		result = fieldBytes(6, concat(fieldString(1, command), fieldString(2, workingDirectory), fieldString(3, reason)))
 	case 3: // WriteResult.permission_denied
 		resultField = 3
-		result = fieldBytes(3, concat(fieldString(1, path), fieldString(4, agentToolPermissionMessage)))
+		result = fieldBytes(3, concat(fieldString(1, path), fieldString(4, reason)))
 	case 4: // DeleteResult.permission_denied
 		resultField = 4
-		result = fieldBytes(4, concat(fieldString(1, path), fieldString(2, agentToolPermissionMessage)))
+		result = fieldBytes(4, concat(fieldString(1, path), fieldString(2, reason)))
 	case 5: // GrepResult.error
 		resultField = 5
-		result = fieldBytes(2, fieldString(1, agentToolPermissionMessage))
+		result = fieldBytes(2, fieldString(1, reason))
 	case 7, 29: // ReadResult.error, including redacted reads
 		resultField = request.number
-		result = fieldBytes(2, concat(fieldString(1, path), fieldString(2, agentToolPermissionMessage)))
+		result = fieldBytes(2, concat(fieldString(1, path), fieldString(2, reason)))
 	case 8: // LsResult.error
 		resultField = 8
-		result = fieldBytes(2, concat(fieldString(1, path), fieldString(2, agentToolPermissionMessage)))
+		result = fieldBytes(2, concat(fieldString(1, path), fieldString(2, reason)))
 	case 9: // DiagnosticsResult.error
 		resultField = 9
-		result = fieldBytes(2, concat(fieldString(1, path), fieldString(2, agentToolPermissionMessage)))
+		result = fieldBytes(2, concat(fieldString(1, path), fieldString(2, reason)))
 	default:
 		return nil
 	}

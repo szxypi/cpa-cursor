@@ -143,8 +143,8 @@ func runAgentTurn(prepared *preparedChat, emitter *chunkEmitter) *statusError {
 		return runAgentToolBridge(prepared, emitter)
 	}
 	prepared.stats.setMode("plain")
-	if cp, text, _ := agentCheckpoints.take(prepared); cp != nil {
-		prepared.stats.setMode("plain-checkpoint")
+	if cp, text, relaxed := agentCheckpoints.take(prepared); cp != nil {
+		prepared.stats.setMode("plain-checkpoint" + relaxed)
 		status, emitted := runPlainAgentTurn(prepared, emitter, cp, text)
 		if status == nil || emitted {
 			return status

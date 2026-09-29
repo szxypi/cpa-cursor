@@ -316,6 +316,9 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 			if err == nil && len(reply) > 0 {
 				if kind := agentExecKind(exec.Value); kind != 36 {
 					a.stats.Load().reject(kind)
+					if kind == 2 || kind == 3 || kind == 5 || kind == 14 {
+						hostLog("info", fmt.Sprintf("native reject kind=%d candidates=%s", kind, catalog.nativeCandidates()))
+					}
 				}
 				a.toolRejections++
 				if a.toolRejections > 16 {
@@ -325,6 +328,9 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 				}
 			}
 			if err == nil && tool != nil {
+				if tool.handoff != nil {
+					a.stats.Load().mapNative(agentExecKind(exec.Value))
+				}
 				if a.onTool != nil {
 					err = a.onTool(tool)
 				} else {
