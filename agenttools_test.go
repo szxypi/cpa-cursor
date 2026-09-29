@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"io"
 	"math"
 	"reflect"
 	"strings"
@@ -719,4 +720,26 @@ func TestAgentInteractionResponse(t *testing.T) {
 			t.Fatalf("kind %d: result = %x, want %x", test.kind, response[1].bytes, test.want)
 		}
 	}
+}
+
+// 未声明任何工具的纯文本请求里，模型发起原生 IDE 操作也只能收到拒绝，不能让整轮失败。
+func TestAgentNativeExecWithoutDeclaredTools(t *testing.T) {
+	pr, pw := io.Pipe()
+	written := make(chan []byte, 1)
+	go func() {
+		buf := make([]byte, 4096)
+		n, _ := pr.Read(buf)
+		written <- buf[:n]
+	}()
+	client := &agentClient{pw: pw, context: &agentContext{blobs: map[string][]byte{}}}
+	shell := fieldBytes(2, concat(fieldVarint(1, 7), fieldBytes(2, fieldString(1, "ls"))))
+	var result agentRunResult
+	client.handleAgentPayload(shell, &result, nil)
+	if result.Fatal != "" {
+		t.Fatalf("native exec without tools failed the turn: %s", result.Fatal)
+	}
+	if reply := <-written; len(reply) < 5 {
+		t.Fatalf("expected a rejection frame, got %x", reply)
+	}
+	pw.Close()
 }

@@ -294,9 +294,15 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 			if err := a.write(a.context.contextResponse(exec.Value)); err != nil {
 				result.Fatal = fmt.Sprintf("cursor AgentService context write failed: %v", err)
 			}
-		} else if a.context != nil && a.context.tools != nil && a.onTool != nil {
+		} else {
+			// 未声明工具的请求用空目录处理：原生工具照常回拒绝、MCP 回 tool_not_found，
+			// 模型会改为直接作答，而不是让整轮失败。
+			catalog := &agentToolCatalog{tools: map[string]cursorTool{}}
+			if a.context != nil && a.context.tools != nil {
+				catalog = a.context.tools
+			}
 			exec, _ := fieldFirst(fields, 2)
-			tool, reply, err := a.context.tools.parseExec(exec.Value)
+			tool, reply, err := catalog.parseExec(exec.Value)
 			if err == nil && len(reply) > 0 {
 				if kind := agentExecKind(exec.Value); kind != 36 {
 					a.stats.Load().reject(kind)
@@ -309,13 +315,15 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 				}
 			}
 			if err == nil && tool != nil {
-				err = a.onTool(tool)
+				if a.onTool != nil {
+					err = a.onTool(tool)
+				} else {
+					err = a.write(agentExecThrowFrames(tool.id, agentToolPermissionMessage))
+				}
 			}
 			if err != nil {
 				result.Fatal = "cursor invalid_request_error: tool protocol unavailable: " + err.Error()
 			}
-		} else {
-			result.Fatal = "cursor invalid_request_error: no client tool was declared for the requested IDE operation"
 		}
 		return
 	}

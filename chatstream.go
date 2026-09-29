@@ -155,6 +155,8 @@ func runAgentTurn(prepared *preparedChat, emitter *chunkEmitter) *statusError {
 	}
 	defer client.close()
 	client.context = requestContext
+	prepared.stats.setMode("plain")
+	client.stats.Store(prepared.stats)
 
 	result := client.runTurn(runFrame, func(delta string) error {
 		return emitter.textDelta(delta)
