@@ -13,6 +13,7 @@ type completionAggregator struct {
 	id        string
 	created   int64
 	content   strings.Builder
+	reasoning strings.Builder
 	toolCalls []map[string]any
 	finish    string
 	usage     map[string]any
@@ -35,8 +36,9 @@ func (a *completionAggregator) consume(chunk []byte) error {
 		Created int64  `json:"created"`
 		Choices []struct {
 			Delta struct {
-				Content   string `json:"content"`
-				ToolCalls []struct {
+				Content          string `json:"content"`
+				ReasoningContent string `json:"reasoning_content"`
+				ToolCalls        []struct {
 					Index    int    `json:"index"`
 					ID       string `json:"id"`
 					Type     string `json:"type"`
@@ -48,7 +50,7 @@ func (a *completionAggregator) consume(chunk []byte) error {
 			} `json:"delta"`
 			FinishReason *string `json:"finish_reason"`
 		} `json:"choices"`
-		Usage map[string]int `json:"usage"`
+		Usage map[string]any `json:"usage"`
 	}
 	if err := json.Unmarshal([]byte(data), &parsed); err != nil {
 		return nil // tolerate stray frames
@@ -68,6 +70,9 @@ func (a *completionAggregator) consume(chunk []byte) error {
 	for _, choice := range parsed.Choices {
 		if choice.Delta.Content != "" {
 			a.content.WriteString(choice.Delta.Content)
+		}
+		if choice.Delta.ReasoningContent != "" {
+			a.reasoning.WriteString(choice.Delta.ReasoningContent)
 		}
 		for _, tc := range choice.Delta.ToolCalls {
 			for len(a.toolCalls) <= tc.Index {
@@ -112,6 +117,9 @@ func (a *completionAggregator) completion() ([]byte, error) {
 	message := map[string]any{
 		"role":    "assistant",
 		"content": a.content.String(),
+	}
+	if a.reasoning.Len() > 0 {
+		message["reasoning_content"] = a.reasoning.String()
 	}
 	if len(a.toolCalls) > 0 {
 		message["tool_calls"] = a.toolCalls

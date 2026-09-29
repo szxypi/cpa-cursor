@@ -157,6 +157,7 @@ func runAgentTurn(prepared *preparedChat, emitter *chunkEmitter) *statusError {
 	client.context = requestContext
 	prepared.stats.setMode("plain")
 	client.stats.Store(prepared.stats)
+	client.onThinking = emitter.reasoningDelta
 
 	result := client.runTurn(runFrame, func(delta string) error {
 		return emitter.textDelta(delta)

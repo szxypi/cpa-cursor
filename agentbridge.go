@@ -20,11 +20,12 @@ const agentSegmentTimeout = 5 * time.Minute
 const agentMaxPending = 64
 
 type agentBridgeEvent struct {
-	Text string
-	Tool *agentToolRequest
-	ID   string
-	Done bool
-	Err  *statusError
+	Text     string
+	Thinking string
+	Tool     *agentToolRequest
+	ID       string
+	Done     bool
+	Err      *statusError
 }
 type agentBridgeSession struct {
 	ctx       context.Context
@@ -372,6 +373,7 @@ func startAgentBridge(p *preparedChat) (*agentBridgeSession, *statusError) {
 	client.context = state
 	client.stats.Store(p.stats)
 	s := &agentBridgeSession{ctx: ctx, cancel: cancel, client: client, release: release, events: make(chan agentBridgeEvent, 128)}
+	client.onThinking = func(text string) error { return s.publish(agentBridgeEvent{Thinking: text}) }
 	client.onTool = func(tool *agentToolRequest) error {
 		return s.publish(agentBridgeEvent{Tool: tool, ID: agentToolIDPrefix + strings.ReplaceAll(randomUUID(), "-", "")})
 	}
@@ -409,6 +411,9 @@ func emitAgentBridgeEvent(e agentBridgeEvent, emitter *chunkEmitter) error {
 	if e.Text != "" {
 		return emitter.textDelta(e.Text)
 	}
+	if e.Thinking != "" {
+		return emitter.reasoningDelta(e.Thinking)
+	}
 	if e.Tool != nil {
 		return emitter.toolCall(&toolCallResult{ID: e.ID, Name: e.Tool.Name, Arguments: e.Tool.Arguments, IsLast: true})
 	}
@@ -437,7 +442,7 @@ func consumeAgentBridge(s *agentBridgeSession, p *preparedChat, emitter *chunkEm
 				if e.Err != nil {
 					return delivered, e.Err
 				}
-				if len(delivered) == 0 {
+				if !agentDeliveredContent(delivered) {
 					return delivered, newStatusError(502, "upstream_error", "Cursor returned no content")
 				}
 				return delivered, nil
@@ -465,6 +470,16 @@ func consumeAgentBridge(s *agentBridgeSession, p *preparedChat, emitter *chunkEm
 			}
 		}
 	}
+}
+
+// agentDeliveredContent 判断是否交付过正文或工具调用；只有思考内容不算有效回复。
+func agentDeliveredContent(events []agentBridgeEvent) bool {
+	for _, e := range events {
+		if e.Text != "" || e.Tool != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func hasAgentToolResult(messages []openAIMessage) bool {

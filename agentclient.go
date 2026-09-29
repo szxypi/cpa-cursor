@@ -40,6 +40,7 @@ type agentClient struct {
 	cancel         context.CancelFunc
 	context        *agentContext
 	onTool         func(*agentToolRequest) error
+	onThinking     func(string) error
 	writeMu        sync.Mutex
 	toolRejections int
 	// stats 指向当前正在消费本 run 的 HTTP 轮次；续接时会切换。
@@ -358,6 +359,15 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 				}
 				return
 			}
+		}
+	}
+	if update.ThinkingDelta != "" && a.onThinking != nil {
+		if err := a.onThinking(update.ThinkingDelta); err != nil {
+			result.Fatal = "cursor AgentService downstream write failed"
+			if a.cancel != nil {
+				a.cancel()
+			}
+			return
 		}
 	}
 	if update.Finished {

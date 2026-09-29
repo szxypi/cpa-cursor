@@ -755,8 +755,9 @@ func createRequestContextResponse() []byte {
 
 // agentUpdate is one decoded interaction_update event.
 type agentUpdate struct {
-	TextDelta string
-	Finished  bool
+	TextDelta     string
+	ThinkingDelta string
+	Finished      bool
 }
 
 // decodeAgentServerMessage parses one AgentServerMessage payload.
@@ -769,6 +770,9 @@ func decodeAgentServerMessage(payload []byte) (update agentUpdate, execRequest b
 		if uf, ok := fieldFirst(updateFields, 1); ok && uf.IsLen {
 			textFields := decodeMessage(uf.Value)
 			update.TextDelta = fieldStringFirst(textFields, 1)
+		}
+		if tf, ok := fieldFirst(updateFields, 4); ok && tf.IsLen {
+			update.ThinkingDelta = fieldStringFirst(decodeMessage(tf.Value), 1)
 		}
 		if _, ok := fieldFirst(updateFields, 14); ok {
 			update.Finished = true

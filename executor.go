@@ -205,6 +205,16 @@ func (e *chunkEmitter) thinkingDelta(delta string) error {
 	return nil
 }
 
+// reasoningDelta 以 OpenAI reasoning_content 实时转发 AgentService 的思考流；宿主会把它
+// 转成客户端格式（如 Anthropic thinking 块），让客户端在模型思考期间就能看到进度。
+func (e *chunkEmitter) reasoningDelta(delta string) error {
+	if delta == "" {
+		return nil
+	}
+	e.thinking.WriteString(delta)
+	return e.sendChunk(e.baseChunk(map[string]any{"reasoning_content": delta}))
+}
+
 // visibleComposerContent returns everything after the closing </think> tag,
 // or everything when the model never opened one.
 func visibleComposerContent(thinking string) string {

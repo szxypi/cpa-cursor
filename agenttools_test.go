@@ -785,3 +785,44 @@ func TestAgentUsageFromUpstream(t *testing.T) {
 		t.Fatalf("usage = %+v", chunk.Usage)
 	}
 }
+
+// 思考流要实时转发为 reasoning_content；非流式聚合在 usage 含嵌套对象时不能丢掉结尾块。
+func TestAgentThinkingForwardedAndAggregated(t *testing.T) {
+	update, _, _ := decodeAgentServerMessage(fieldBytes(1, fieldBytes(4, fieldString(1, "pondering"))))
+	if update.ThinkingDelta != "pondering" {
+		t.Fatalf("thinking delta = %q", update.ThinkingDelta)
+	}
+	agg := newCompletionAggregator("m")
+	emitter := newChunkEmitter("m", false, false, agg.consume)
+	emitter.stats = &agentTurnStats{ended: true, inTokens: 50, cacheRead: 40, outTokens: 7}
+	if err := emitter.reasoningDelta("pondering"); err != nil {
+		t.Fatal(err)
+	}
+	if err := emitter.textDelta("answer"); err != nil {
+		t.Fatal(err)
+	}
+	if err := emitter.finishChunk(10); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := agg.completion()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out struct {
+		Choices []struct {
+			Message struct {
+				Content   string `json:"content"`
+				Reasoning string `json:"reasoning_content"`
+			} `json:"message"`
+			Finish string `json:"finish_reason"`
+		} `json:"choices"`
+		Usage map[string]any `json:"usage"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatal(err)
+	}
+	m := out.Choices[0].Message
+	if m.Content != "answer" || m.Reasoning != "pondering" || out.Usage["prompt_tokens"] != float64(50) || out.Usage["prompt_tokens_details"] == nil {
+		t.Fatalf("completion = %s", raw)
+	}
+}
