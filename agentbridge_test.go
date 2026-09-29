@@ -155,3 +155,25 @@ func TestOriginalToolErrorPreserved(t *testing.T) {
 		t.Fatal("client tool denial lost")
 	}
 }
+
+// 工具结果之后附带的用户消息（如 system-reminder）不能阻断续接，且要随结果一起回传给上游。
+func TestBridgeResumesWithTrailingUserMessages(t *testing.T) {
+	b, p, s, tool := testBridgeStore(t)
+	id := "call_cpa_trailing"
+	if err := b.park(id, s, tool, p, "reading"); err != nil {
+		t.Fatal(err)
+	}
+	next := toolContinuation(p, id, tool, "reading", "fixture-body")
+	next.parsed.RawMessages = append(next.parsed.RawMessages, openAIMessage{Role: "user", Content: json.RawMessage(`"reminder-77"`)})
+	if _, _, err := b.claim(id, next); err != nil {
+		t.Fatalf("trailing user message blocked resume: %v", err)
+	}
+	ms := next.parsed.RawMessages
+	last := agentTrailingStart(ms) - 1
+	if last != len(ms)-2 {
+		t.Fatalf("tool result index = %d", last)
+	}
+	if got := agentResumeText(ms, last); got != "fixture-body\n\n<user_message>\nreminder-77\n</user_message>" {
+		t.Fatalf("resume text = %q", got)
+	}
+}

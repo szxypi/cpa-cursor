@@ -234,7 +234,12 @@ func (b *agentBridgeStore) claim(id string, p *preparedChat) (*agentPendingCall,
 // claimLocked 在持锁状态下校验续接请求；返回的 stale 需在释放锁后关闭其上游会话。
 func (b *agentBridgeStore) claimLocked(id string, p *preparedChat) (call, stale *agentPendingCall, status *statusError) {
 	call = b.calls[id]
-	if call == nil || call.binding != p.binding {
+	if call == nil {
+		p.stats.setMiss("no_pending")
+		return nil, nil, errAgentContinuationLost
+	}
+	if call.binding != p.binding {
+		p.stats.setMiss("binding")
 		return nil, nil, errAgentContinuationLost
 	}
 	evict := func() *agentPendingCall {
@@ -248,12 +253,22 @@ func (b *agentBridgeStore) claimLocked(id string, p *preparedChat) (call, stale 
 		return call
 	}
 	if !b.now().Before(call.expiry) {
+		p.stats.setMiss("expired")
 		return nil, evict(), errAgentContinuationLost
 	}
 	// 同一调用方改写了历史（其他插件压缩工具输出、客户端重排消息等）时旧会话已无法对应，
 	// 释放它并由调用方重开；当前按一个工具一轮交付，上游并发调用在队列中依次交付。
 	ms := p.parsed.RawMessages
-	matches := call.tools == agentToolsHash(p.parsed.Tools) && len(ms) == call.prefixLen+2 && agentHistoryHash(ms[:call.prefixLen]) == call.prefix
+	miss := ""
+	switch {
+	case call.tools != agentToolsHash(p.parsed.Tools):
+		miss = "tools"
+	case len(ms) < call.prefixLen+2 || agentTrailingStart(ms) != call.prefixLen+2:
+		miss = fmt.Sprintf("len:%d/%d", len(ms), call.prefixLen+2)
+	case agentHistoryHash(ms[:call.prefixLen]) != call.prefix:
+		miss = "prefix"
+	}
+	matches := miss == ""
 	var result openAIMessage
 	if matches {
 		assistant := ms[call.prefixLen]
@@ -263,14 +278,18 @@ func (b *agentBridgeStore) claimLocked(id string, p *preparedChat) (call, stale 
 			tc := assistant.ToolCalls[0]
 			matches = tc.ID == id && tc.Function.Name == call.tool.Name && canonicalArguments(tc.Function.Arguments) == canonicalArguments(call.tool.Arguments) && contentText(assistant.Content) == call.assistantText
 		}
+		if !matches {
+			miss = "assistant"
+		}
 	}
 	if !matches {
+		p.stats.setMiss(miss)
 		if call.state == "pending" {
 			return nil, evict(), errAgentContinuationLost
 		}
 		return nil, nil, errAgentContinuationLost
 	}
-	resultDigest := sha256.Sum256([]byte(fmt.Sprintf("%t\n%s", p.toolErrors[id], contentText(result.Content))))
+	resultDigest := sha256.Sum256([]byte(fmt.Sprintf("%t\n%s", p.toolErrors[id], agentResumeText(ms, call.prefixLen+1))))
 	if call.state != "pending" && call.resultHash != resultDigest {
 		return nil, nil, bridgeFault("Cursor tool result cannot be changed after submission")
 	}
@@ -457,10 +476,33 @@ func hasAgentToolResult(messages []openAIMessage) bool {
 	return false
 }
 
+// agentTrailingStart 返回末尾连续用户消息之前的位置；客户端常在工具结果后附带
+// 提醒类用户消息（如 Claude Code 的 system-reminder），它们不应阻断续接。
+func agentTrailingStart(ms []openAIMessage) int {
+	i := len(ms)
+	for i > 0 && ms[i-1].Role == "user" {
+		i--
+	}
+	return i
+}
+
+// agentResumeText 是续接时回传给上游的工具结果；工具结果之后的用户消息附在末尾，
+// 因为已在运行中的上游会话只能接收这一条工具结果。
+func agentResumeText(ms []openAIMessage, resultIndex int) string {
+	text := contentText(ms[resultIndex].Content)
+	for _, m := range ms[resultIndex+1:] {
+		if extra := strings.TrimSpace(contentText(m.Content)); extra != "" {
+			text += "\n\n<user_message>\n" + extra + "\n</user_message>"
+		}
+	}
+	return text
+}
+
 func runAgentToolBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 	ms := p.parsed.RawMessages
-	if len(ms) > 0 && ms[len(ms)-1].Role == "tool" && strings.HasPrefix(ms[len(ms)-1].ToolCallID, agentToolIDPrefix) {
-		result := ms[len(ms)-1]
+	last := agentTrailingStart(ms) - 1
+	if last >= 0 && ms[last].Role == "tool" && strings.HasPrefix(ms[last].ToolCallID, agentToolIDPrefix) {
+		result := ms[last]
 		id := result.ToolCallID
 		call, replay, status := pendingAgentTools.claim(id, p)
 		if status == errAgentContinuationLost {
@@ -482,7 +524,7 @@ func runAgentToolBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 		p.stats.setMode("resume")
 		call.session.client.stats.Store(p.stats)
 		// OpenAI tool 结果是实际客户端输出；不在网关执行，也不伪造输出。
-		if err := call.session.client.write(call.tool.resultFrame(contentText(result.Content), p.toolErrors[id])); err != nil {
+		if err := call.session.client.write(call.tool.resultFrame(agentResumeText(ms, last), p.toolErrors[id])); err != nil {
 			call.session.close()
 			status = bridgeFault("Cursor tool continuation disconnected; result was not replayed")
 			pendingAgentTools.complete(call, nil, status)
@@ -491,6 +533,13 @@ func runAgentToolBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 		events, status := consumeAgentBridge(call.session, p, emitter)
 		pendingAgentTools.complete(call, events, status)
 		return status
+	}
+	if last >= 0 {
+		if ms[last].Role != "tool" {
+			p.stats.setMiss("last:" + ms[last].Role)
+		} else {
+			p.stats.setMiss("foreign_id")
+		}
 	}
 	return runFreshAgentBridge(p, emitter)
 }
@@ -514,7 +563,17 @@ func runFreshAgentBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 type agentTurnStats struct {
 	mu      sync.Mutex
 	mode    string
+	miss    string
 	rejects map[int]int
+}
+
+func (s *agentTurnStats) setMiss(reason string) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	s.miss = reason
+	s.mu.Unlock()
 }
 
 func (s *agentTurnStats) setMode(mode string) {
@@ -549,5 +608,9 @@ func (s *agentTurnStats) summary() (string, string) {
 		kinds = append(kinds, fmt.Sprintf("%d:%d", kind, count))
 	}
 	sort.Strings(kinds)
-	return s.mode, strings.Join(kinds, ",")
+	mode := s.mode
+	if s.miss != "" && strings.HasPrefix(mode, "fresh") {
+		mode += "(" + s.miss + ")"
+	}
+	return mode, strings.Join(kinds, ",")
 }
