@@ -64,6 +64,13 @@ machineId 省略时由 token 派生（`sha256(token+"machineId")`，与 9router 
 
 导入后模型即出现在 `/v1/models`（账号有权限的为准），用法与其它提供方一致：`model: cursor/claude-4.5-sonnet` 之类。
 
+## v0.3.33 checkpoint 可重复续接与按调用 ID 匹配
+
+- **可重复续接**：checkpoint 续接后不再删除（内存与磁盘均是），只随 30 分钟过期或容量淘汰，同一会话最多保留 4 个。实测 Cursor 允许同一 checkpoint 多次续接，各分支互不可见。此前 Claude Code 的旁路请求（如 away summary）会先用掉 checkpoint，真实的下一条消息只能以完整历史重开（未命中原因 `prefix_len`）。
+- **按调用 ID 匹配**：严格哈希未命中时，先按上一轮交给客户端的 `call_cpa_` 工具调用 ID 查找（日志 `mode=checkpoint-calls`），再走宽松匹配；宽松匹配不再比较工具入参。PreToolUse hook 改写 Bash 命令、上下文分页替换旧 tool_use 大入参后仍能续接（此前未命中原因为 `reply`、`prefix@i/n:tool`）。
+- 续接时丢弃为本次历史新建的 blob，前后 checkpoint 共用 blob 数据，重复续接不会让内存随轮数翻倍。
+- 已知取舍：工具交接后上游仍会对占位结果多跑一步（约 7s）才结束 run。保持 run 挂起、跨请求写回真实结果可以省掉这一步（实测持续心跳时 Cursor 可等至少 5 分钟），但工具轮响应就拿不到 `turn_ended`，无法上报真实的输入与缓存用量，因此保持现状。
+
 ## v0.3.29–v0.3.32 原生工具转交、宽松续接与 checkpoint 落盘
 
 - **原生工具转交客户端**：Cursor 自带的 Shell（exec 2/14）、Grep（5）、Write（3，二进制除外）在调用方声明了 schema 兼容的同类工具时，转成 `Bash`/`Grep`/`Write`（或小写同名）的 `tool_calls` 交客户端执行，上游收到原生结果类型的「已转交」占位后结束本轮。Shell 的工作目录以 `cd '<dir>' &&` 前缀保留；只声明了 Bash 时，Grep 还原为等价的 `rg` 命令交给 Bash。参数无法一一对应时仍返回权限拒绝，并记录 `native reject kind= candidates=` 便于排查。

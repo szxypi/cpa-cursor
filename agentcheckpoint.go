@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -12,11 +13,17 @@ import (
 const (
 	agentCheckpointTTL   = 30 * time.Minute
 	agentCheckpointLimit = 256
+	// 同一会话保留的 checkpoint 数：旁路请求与真实的下一条消息各自从同一点续接，
+	// 更早的分支点几乎不会再用到。checkpoint 可重复续接后不再随取用删除，靠它限制
+	// 落盘文件与重启后载入内存的总量。
+	agentCheckpointsPerConversation = 4
 )
 
 // agentCheckpoint 是一轮结束时 Cursor 下发的会话状态及其引用的 blob。下一条用户消息
 // 只需携带它和新文本即可续接，服务端不必重新处理整段历史。checkpoint 与账号绑定，
 // 也只对产生它的那段客户端历史有效，因此以调用方身份 + 历史哈希 + 最终回复为键。
+// 实测上游接受同一 checkpoint 多次续接且各分支互不可见，因此取用后不删除：旁路请求
+// （如 away summary）先用掉也不影响真实的下一条消息，只在过期或容量淘汰时移除。
 type agentCheckpoint struct {
 	state          []byte
 	blobs          map[string][]byte
@@ -26,6 +33,9 @@ type agentCheckpoint struct {
 	binding        [32]byte
 	shapes         [][32]byte
 	reply          [32]byte
+	// calls 是本轮交给客户端的工具调用 ID（已排序）。ID 由本插件随机生成，客户端带回
+	// 全部 ID 的结果即表明在续接这一轮，hook 改写调用参数、中间件改写旧历史都不影响。
+	calls []string
 	// 以下仅用于诊断未命中原因，不参与匹配。
 	messages [][32]byte
 	lengths  []int
@@ -95,6 +105,7 @@ func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assist
 		lengths:        agentMessageLengths(p.parsed.RawMessages),
 		shapes:         agentMessageShapes(p.parsed.RawMessages),
 		reply:          agentCheckpointKey([32]byte{}, nil, assistant),
+		calls:          agentCallIDs(assistant),
 	}
 	key := agentCheckpointKey(p.binding, p.parsed.RawMessages, assistant)
 	s.mu.Lock()
@@ -104,6 +115,23 @@ func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assist
 	for k, v := range s.m {
 		if !now.Before(v.expiry) {
 			delete(s.m, k)
+		}
+	}
+	if cp.conversationID != "" {
+		var same [][32]byte
+		for k, v := range s.m {
+			if k != key && v.conversationID == cp.conversationID {
+				same = append(same, k)
+			}
+		}
+		if excess := len(same) - agentCheckpointsPerConversation + 1; excess > 0 {
+			slices.SortFunc(same, func(a, b [32]byte) int { return s.m[a].expiry.Compare(s.m[b].expiry) })
+			for _, k := range same[:excess] {
+				delete(s.m, k)
+				if s.disk != "" {
+					go s.removeDisk(s.disk, k)
+				}
+			}
 		}
 	}
 	if len(s.m) >= agentCheckpointLimit {
@@ -124,7 +152,7 @@ func (s *agentCheckpointStore) save(p *preparedChat, client *agentClient, assist
 
 // take 取出与本次请求历史对应的 checkpoint，并返回作为新用户消息发送的文本：上一轮
 // 交给客户端的工具结果，加上之后的用户消息。无法续接时返回原因，调用方带完整历史重开；
-// 以宽松匹配命中时第三个返回值为 "-relaxed"。
+// 按工具调用 ID 或宽松匹配命中时第三个返回值为 "-calls" / "-relaxed"。
 func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string, string) {
 	ms := p.parsed.RawMessages
 	start := agentTrailingStart(ms)
@@ -176,20 +204,17 @@ func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string, 
 	}
 	key := agentCheckpointKey(p.binding, ms[:a], assistant)
 	s.mu.Lock()
-	cp := s.m[key]
-	delete(s.m, key)
-	relaxed := ""
-	if cp == nil {
-		if k, found := s.findRelaxed(p.binding, ms[:a], assistant); found != nil {
-			cp, relaxed = found, "-relaxed"
-			delete(s.m, k)
+	cp, match := s.m[key], ""
+	if cp == nil && s.disk != "" {
+		if cp = s.loadDisk(s.disk, key); cp != nil {
+			s.m[key] = cp
 		}
 	}
-	if s.disk != "" {
-		if cp == nil {
-			cp = s.loadDisk(s.disk, key)
-		} else {
-			s.removeDisk(s.disk, key)
+	if cp == nil {
+		if cp = s.findByCalls(p.binding, assistant); cp != nil {
+			match = "-calls"
+		} else if cp = s.findRelaxed(p.binding, ms[:a], assistant); cp != nil {
+			match = "-relaxed"
 		}
 	}
 	s.mu.Unlock()
@@ -201,39 +226,68 @@ func (s *agentCheckpointStore) take(p *preparedChat) (*agentCheckpoint, string, 
 	case cp.tools != agentToolsHash(p.parsed.Tools):
 		return nil, "", "tools"
 	}
-	return cp, strings.Join(texts, "\n\n"), relaxed
+	return cp, strings.Join(texts, "\n\n"), match
 }
 
-// findRelaxed 容忍上游中间件（如上下文分页、输出压缩）改写旧的 user/tool/system 文本：
-// 消息条数、角色、工具调用 ID 必须一致，assistant 消息与最终回复必须完全相同。
-// checkpoint 保存的是改写前的完整内容，续接不会丢失信息。调用方须持有 s.mu。
-func (s *agentCheckpointStore) findRelaxed(binding [32]byte, prefix []openAIMessage, assistant openAIMessage) ([32]byte, *agentCheckpoint) {
-	shapes := agentMessageShapes(prefix)
-	reply := agentCheckpointKey([32]byte{}, nil, assistant)
-	for k, cp := range s.m {
-		if cp.binding != binding || cp.reply != reply || len(cp.shapes) != len(shapes) {
-			continue
+// agentCallIDs 返回回复中由本插件生成的工具调用 ID（已排序）；含其他来源的 ID 时返回 nil。
+func agentCallIDs(m openAIMessage) []string {
+	var ids []string
+	for _, call := range m.ToolCalls {
+		if !strings.HasPrefix(call.ID, agentToolIDPrefix) {
+			return nil
 		}
-		same := true
-		for i := range shapes {
-			if cp.shapes[i] != shapes[i] {
-				same = false
-				break
-			}
-		}
-		if same {
-			return k, cp
+		ids = append(ids, call.ID)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+// findByCalls 按上一轮交给客户端的工具调用 ID 查找 checkpoint。调用方须持有 s.mu。
+func (s *agentCheckpointStore) findByCalls(binding [32]byte, assistant openAIMessage) *agentCheckpoint {
+	ids := agentCallIDs(assistant)
+	if len(ids) == 0 {
+		return nil
+	}
+	now := s.now()
+	for _, cp := range s.m {
+		if cp.binding == binding && now.Before(cp.expiry) && slices.Equal(cp.calls, ids) {
+			return cp
 		}
 	}
-	return [32]byte{}, nil
+	return nil
 }
 
-// agentMessageShapes 为每条消息取结构指纹：assistant 取完整内容，其余只取角色与工具调用 ID。
+// findRelaxed 容忍上游中间件（如上下文分页、输出压缩）改写旧的 user/tool/system 文本和
+// 旧工具调用的入参：消息条数、角色、工具调用 ID 必须一致，assistant 正文与最终回复必须
+// 完全相同。checkpoint 保存的是改写前的完整内容，续接不会丢失信息。调用方须持有 s.mu。
+func (s *agentCheckpointStore) findRelaxed(binding [32]byte, prefix []openAIMessage, assistant openAIMessage) *agentCheckpoint {
+	shapes := agentMessageShapes(prefix)
+	reply := agentCheckpointKey([32]byte{}, nil, assistant)
+	now := s.now()
+	var best *agentCheckpoint
+	for _, cp := range s.m {
+		if cp.binding != binding || cp.reply != reply || !now.Before(cp.expiry) || !slices.Equal(cp.shapes, shapes) {
+			continue
+		}
+		if best == nil || cp.expiry.After(best.expiry) {
+			best = cp
+		}
+	}
+	return best
+}
+
+// agentMessageShapes 为每条消息取结构指纹：assistant 取正文与工具调用 ID/名称（不含入参，
+// 上下文分页会把旧调用的大段入参换成回执），其余只取角色与工具调用 ID。
 func agentMessageShapes(ms []openAIMessage) [][32]byte {
 	out := make([][32]byte, len(ms))
 	for i, m := range ms {
 		if m.Role == "assistant" {
-			out[i] = agentHistoryHash(ms[i : i+1])
+			var b strings.Builder
+			b.WriteString("assistant\x00" + contentText(m.Content))
+			for _, call := range m.ToolCalls {
+				b.WriteString("\x00" + call.ID + "\x00" + call.Function.Name)
+			}
+			out[i] = sha256.Sum256([]byte(b.String()))
 			continue
 		}
 		out[i] = sha256.Sum256([]byte(m.Role + "\x00" + m.ToolCallID))
@@ -244,10 +298,11 @@ func agentMessageShapes(ms []openAIMessage) [][32]byte {
 // apply 让新 run 以 checkpoint 为会话状态、只发送新用户消息；本次请求的规则与工具仍由
 // requestContext 实时提供。
 func (cp *agentCheckpoint) apply(c *agentContext, text string) {
+	// 续接的 run 只引用 checkpoint 链上的 blob；为本次请求历史新建的 blob 不会被读取，
+	// 丢弃它们，前后 checkpoint 共用同一份 blob 数据，可重复续接后内存也不随轮数翻倍。
+	c.blobs = make(map[string][]byte, len(cp.blobs))
 	for k, v := range cp.blobs {
-		if _, exists := c.blobs[k]; !exists {
-			c.blobs[k] = v
-		}
+		c.blobs[k] = v
 	}
 	c.state = cp.state
 	c.conversationID = cp.conversationID

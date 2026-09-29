@@ -29,6 +29,7 @@ type agentCheckpointFile struct {
 	Lengths        []int
 	Reply          [32]byte
 	Shapes         [][32]byte
+	Calls          []string
 }
 
 // enableDisk 开启落盘，并把未过期的 checkpoint 载入内存，使宽松匹配在重启后同样可用。
@@ -80,7 +81,7 @@ func agentCheckpointPath(dir string, key [32]byte) string {
 
 func (s *agentCheckpointStore) persist(dir string, key [32]byte, cp *agentCheckpoint) {
 	var buf bytes.Buffer
-	if err := gob.NewEncoder(&buf).Encode(agentCheckpointFile{cp.state, cp.blobs, cp.conversationID, cp.tools, cp.expiry, cp.binding, cp.messages, cp.lengths, cp.reply, cp.shapes}); err != nil {
+	if err := gob.NewEncoder(&buf).Encode(agentCheckpointFile{cp.state, cp.blobs, cp.conversationID, cp.tools, cp.expiry, cp.binding, cp.messages, cp.lengths, cp.reply, cp.shapes, cp.calls}); err != nil {
 		return
 	}
 	if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -101,14 +102,13 @@ func (s *agentCheckpointStore) persist(dir string, key [32]byte, cp *agentCheckp
 	}
 }
 
-// loadDisk 取出并删除磁盘上的 checkpoint（与内存一样只用一次）；调用方须持有 s.mu。
+// loadDisk 读取磁盘上的 checkpoint；与内存一样可重复续接，文件只随过期清理删除。
+// 调用方须持有 s.mu。
 func (s *agentCheckpointStore) loadDisk(dir string, key [32]byte) *agentCheckpoint {
-	path := agentCheckpointPath(dir, key)
-	data, err := os.ReadFile(path)
+	data, err := os.ReadFile(agentCheckpointPath(dir, key))
 	if err != nil {
 		return nil
 	}
-	os.Remove(path)
 	return decodeAgentCheckpoint(data)
 }
 
@@ -117,7 +117,7 @@ func decodeAgentCheckpoint(data []byte) *agentCheckpoint {
 	if gob.NewDecoder(bytes.NewReader(data)).Decode(&f) != nil {
 		return nil
 	}
-	return &agentCheckpoint{state: f.State, blobs: f.Blobs, conversationID: f.ConversationID, tools: f.Tools, expiry: f.Expiry, binding: f.Binding, messages: f.Messages, lengths: f.Lengths, reply: f.Reply, shapes: f.Shapes}
+	return &agentCheckpoint{state: f.State, blobs: f.Blobs, conversationID: f.ConversationID, tools: f.Tools, expiry: f.Expiry, binding: f.Binding, messages: f.Messages, lengths: f.Lengths, reply: f.Reply, shapes: f.Shapes, calls: f.Calls}
 }
 
 func (s *agentCheckpointStore) removeDisk(dir string, key [32]byte) {

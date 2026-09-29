@@ -83,7 +83,8 @@ func runAgentLiveToolLoop(t *testing.T, resume bool) {
 		assistant := completion.Choices[0].Message
 		mode, _ := prepared.stats.summary()
 		t.Logf("turn=%d mode=%s elapsed=%v finish=%s tools=%d tokens=[%s] text=%q", turn, mode, time.Since(started).Round(time.Millisecond), completion.Choices[0].Reason, len(assistant.ToolCalls), prepared.stats.tokenSummary(), contentText(assistant.Content))
-		if resume && turn > 0 && mode != "checkpoint" {
+		// summary 在模式后附带 " cp=saved|none"，只比较模式本身。
+		if resume && turn > 0 && strings.SplitN(mode, " ", 2)[0] != "checkpoint" {
 			t.Errorf("turn %d did not continue from the checkpoint: %s", turn, mode)
 		}
 		if len(assistant.ToolCalls) == 0 {
