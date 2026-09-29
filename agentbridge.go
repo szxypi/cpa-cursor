@@ -348,7 +348,7 @@ func (b *agentBridgeStore) shutdown() {
 	}
 }
 
-func startAgentBridge(p *preparedChat) (*agentBridgeSession, *statusError) {
+func startAgentBridge(p *preparedChat, cp *agentCheckpoint, resumeText string) (*agentBridgeSession, *statusError) {
 	catalog, err := newAgentToolCatalog(p.parsed.Tools)
 	if err != nil {
 		return nil, bridgeFault("invalid Cursor client tool definitions: " + err.Error())
@@ -369,6 +369,9 @@ func startAgentBridge(p *preparedChat) (*agentBridgeSession, *statusError) {
 		return nil, newStatusError(502, "upstream_network_error", "Cursor AgentService connection failed")
 	}
 	state := newAgentContext(p.parsed.Messages)
+	if cp != nil {
+		cp.apply(state, resumeText)
+	}
 	state.tools = catalog
 	client.context = state
 	client.stats.Store(p.stats)
@@ -445,6 +448,7 @@ func consumeAgentBridge(s *agentBridgeSession, p *preparedChat, emitter *chunkEm
 				if !agentDeliveredContent(delivered) {
 					return delivered, newStatusError(502, "upstream_error", "Cursor returned no content")
 				}
+				agentCheckpoints.save(p, s.client, text.String())
 				return delivered, nil
 			}
 			if e.Text != "" {
@@ -566,7 +570,20 @@ func runFreshAgentBridge(p *preparedChat, emitter *chunkEmitter) *statusError {
 	} else {
 		p.stats.setMode("fresh")
 	}
-	session, status := startAgentBridge(p)
+	if cp, text := agentCheckpoints.take(p); cp != nil {
+		p.stats.setMode("checkpoint")
+		session, status := startAgentBridge(p, cp, text)
+		if status == nil {
+			var delivered []agentBridgeEvent
+			delivered, status = consumeAgentBridge(session, p, emitter)
+			if status == nil || len(delivered) > 0 {
+				return status
+			}
+		}
+		p.stats.setMode("fresh-history")
+		p.stats.setMiss("checkpoint_failed")
+	}
+	session, status := startAgentBridge(p, nil, "")
 	if status != nil {
 		return status
 	}

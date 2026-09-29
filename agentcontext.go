@@ -16,6 +16,10 @@ type agentContext struct {
 	rules []byte
 	blobs map[string][]byte
 	tools *agentToolCatalog
+	// conversationID 在首次构造 run 帧时生成；resumeText 非空表示 state 来自 checkpoint，
+	// run 只携带这段新用户文本。
+	conversationID string
+	resumeText     string
 }
 
 func newAgentContext(messages []cursorMessage) *agentContext {

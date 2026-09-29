@@ -142,37 +142,61 @@ func runAgentTurn(prepared *preparedChat, emitter *chunkEmitter) *statusError {
 	if len(prepared.parsed.Tools) > 0 || hasAgentToolResult(prepared.parsed.RawMessages) {
 		return runAgentToolBridge(prepared, emitter)
 	}
+	prepared.stats.setMode("plain")
+	if cp, text := agentCheckpoints.take(prepared); cp != nil {
+		prepared.stats.setMode("plain-checkpoint")
+		status, emitted := runPlainAgentTurn(prepared, emitter, cp, text)
+		if status == nil || emitted {
+			return status
+		}
+		prepared.stats.setMode("plain")
+		prepared.stats.setMiss("checkpoint_failed")
+	}
+	status, _ := runPlainAgentTurn(prepared, emitter, nil, "")
+	return status
+}
+
+// runPlainAgentTurn 执行一次无工具 run；emitted 表示是否已向客户端输出过内容。
+func runPlainAgentTurn(prepared *preparedChat, emitter *chunkEmitter, cp *agentCheckpoint, resumeText string) (*statusError, bool) {
 	headers := buildCursorHeaders(prepared.identity)
 	requestContext := newAgentContext(prepared.parsed.Messages)
+	if cp != nil {
+		cp.apply(requestContext, resumeText)
+	}
 	runFrame := buildAgentRunFrame(prepared.parsed.Messages, prepared.model, requestContext)
+	emitted := false
 
 	ctx, cancel := contextBackgroundWithTimeout()
 	defer cancel()
 	client, _, err := openAgentStream(ctx, cursorAgentBase+cursorAgentRun, headers)
 	if err != nil {
 		return newStatusError(http.StatusBadGateway, "upstream_error",
-			"cursor AgentService request failed: "+err.Error())
+			"cursor AgentService request failed: "+err.Error()), false
 	}
 	defer client.close()
 	client.context = requestContext
-	prepared.stats.setMode("plain")
 	client.stats.Store(prepared.stats)
-	client.onThinking = emitter.reasoningDelta
+	client.onThinking = func(delta string) error {
+		emitted = true
+		return emitter.reasoningDelta(delta)
+	}
 
 	result := client.runTurn(runFrame, func(delta string) error {
+		emitted = true
 		return emitter.textDelta(delta)
 	}, traceAgentModel(prepared.model))
 	recordAgentTrace(prepared.model, result)
 	if result.Fatal != "" {
-		return classifyAgentFailure(result.Fatal)
+		return classifyAgentFailure(result.Fatal), emitted
 	}
 	if strings.TrimSpace(result.Text) == "" && !emitter.sawToolCalls() {
 		if result.TrailerCode != "" && result.TrailerCode != "ok" {
-			return classifyAgentFailure("cursor AgentService " + result.TrailerCode)
+			return classifyAgentFailure("cursor AgentService " + result.TrailerCode), emitted
 		}
-		return newStatusError(http.StatusBadGateway, "upstream_error", "cursor AgentService returned no content")
+		return newStatusError(http.StatusBadGateway, "upstream_error", "cursor AgentService returned no content"), emitted
 	}
-	return nil
+	agentCheckpoints.save(prepared, client, result.Text)
+	return nil, emitted
 }
 
 // classifyAgentFailure maps protocol-level agent failures onto client-facing

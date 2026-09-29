@@ -703,6 +703,15 @@ func buildAgentRunFrame(messages []cursorMessage, model string, contexts ...*age
 			}
 		}
 	}
+	var ctx *agentContext
+	if len(contexts) > 0 {
+		ctx = contexts[0]
+	}
+	if ctx != nil && ctx.resumeText != "" {
+		history = nil
+		currentIndex = len(chat)
+		chat = append(chat, cursorMessage{Role: "user", Content: ctx.resumeText})
+	}
 	current := cursorMessage{Role: "user", Content: "Continue."}
 	if currentIndex >= 0 {
 		current = chat[currentIndex]
@@ -737,8 +746,11 @@ func buildAgentRunFrame(messages []cursorMessage, model string, contexts ...*age
 		fieldBytes(1, state),
 		fieldBytes(2, conversationAction),
 	)
-	if len(contexts) > 0 && contexts[0] != nil {
-		runRequest = concat(runRequest, fieldString(5, uuidFactory()))
+	if ctx != nil {
+		if ctx.conversationID == "" {
+			ctx.conversationID = uuidFactory()
+		}
+		runRequest = concat(runRequest, fieldString(5, ctx.conversationID))
 	}
 	runRequest = concat(runRequest, fieldBytes(9, requestedModel))
 	return wrapConnectFrame(fieldBytes(1, runRequest))

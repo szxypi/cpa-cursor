@@ -34,13 +34,15 @@ var agentHTTPClient = &http.Client{Transport: &http.Transport{
 
 // agentClient wraps one duplex AgentService run.
 type agentClient struct {
-	pr             *io.PipeReader
-	pw             *io.PipeWriter
-	resp           *http.Response
-	cancel         context.CancelFunc
-	context        *agentContext
-	onTool         func(*agentToolRequest) error
-	onThinking     func(string) error
+	pr         *io.PipeReader
+	pw         *io.PipeWriter
+	resp       *http.Response
+	cancel     context.CancelFunc
+	context    *agentContext
+	onTool     func(*agentToolRequest) error
+	onThinking func(string) error
+	// checkpoint 是最近一次 conversation_checkpoint_update，run 正常结束时即为完整会话状态。
+	checkpoint     []byte
 	writeMu        sync.Mutex
 	toolRejections int
 	// stats 指向当前正在消费本 run 的 HTTP 轮次；续接时会切换。
@@ -271,6 +273,10 @@ func (a *agentClient) handleAgentPayload(payload []byte, result *agentRunResult,
 			result.Fatal = "cursor AgentService KV exchange failed"
 			result.Finished = true
 		}
+		return
+	}
+	if cp, ok := fieldFirst(fields, 3); ok && cp.IsLen {
+		a.checkpoint = append([]byte(nil), cp.Value...)
 		return
 	}
 	if query, ok := fieldFirst(fields, 7); ok && query.IsLen {
