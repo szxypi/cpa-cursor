@@ -262,6 +262,8 @@ func managementModels(authName, versionOverride, clientTypeOverride string) ([]b
 		})
 	}
 	infos := fetchModelsWithOverrides(cred, versionOverride, clientTypeOverride)
+	// List the effort families too, so that the selection can enable them.
+	infos = append(infos, cursorFamilyInfos(deriveCursorFamilies(infos))...)
 	set := selectedModelSet()
 	rows := make([]map[string]any, 0, len(infos))
 	for _, m := range infos {

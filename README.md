@@ -64,6 +64,14 @@ machineId 省略时由 token 派生（`sha256(token+"machineId")`，与 9router 
 
 导入后模型即出现在 `/v1/models`（账号有权限的为准），用法与其它提供方一致：`model: cursor/claude-4.5-sonnet` 之类。
 
+## v0.3.34 思考档位族模型
+
+- **问题**：AgentService 的 run 请求只带模型 ID，不带思考档位。Cursor 为每个档位提供单独的 ID（如 `grok-4.7-low-fast` … `grok-4.7-xhigh-fast`）。插件以前只在已停用的 ChatService 路径里映射 medium/high，所以客户端发的 `reasoning_effort` 全部被忽略。
+- **族模型**：插件从账号目录里找出只有档位不同的一组 ID，再注册一个族 ID，格式为 `cursor-<base>[-fast]`，例如 `cursor-grok-4.7-fast`、`cursor-claude-opus-5-5`。请求族 ID 时，插件按 `reasoning_effort` 选对应的变体。没有该档位时先向上取，再向下取。没有档位或档位无法识别时用 medium。族 ID 带 `cursor-` 前缀，是为了不和 xai 的同名模型合成一个池。
+- 族模型在 `/v1/models` 里带 `thinking.levels`，列出可选的档位。面板的模型列表也列出族模型，要勾选后才会注册。
+- 原有的变体 ID 行为不变，固定使用 ID 里的档位。
+- 日志 `turn model=` 记录实际发给 Cursor 的变体 ID，响应里的 `model` 仍是客户端请求的族 ID。
+
 ## v0.3.33 checkpoint 可重复续接与按调用 ID 匹配
 
 - **可重复续接**：checkpoint 续接后不再删除（内存与磁盘均是），只随 30 分钟过期或容量淘汰，同一会话最多保留 4 个。实测 Cursor 允许同一 checkpoint 多次续接，各分支互不可见。此前 Claude Code 的旁路请求（如 away summary）会先用掉 checkpoint，真实的下一条消息只能以完整历史重开（未命中原因 `prefix_len`）。

@@ -62,6 +62,9 @@ func prepareChat(req rpcExecutorRequest) (*preparedChat, *statusError) {
 	if model == "" {
 		return nil, newStatusError(http.StatusBadRequest, "invalid_request", "cursor request carries no model")
 	}
+	// The AgentService run request selects effort only through the model id,
+	// so a family id becomes the variant for the requested effort.
+	model = resolveCursorModel(cred.identity(), model, parsed.ReasoningEffort)
 
 	// Claude Code's user agent forces Cursor's agent mode on the ChatService
 	// path too (9router's forceAgentMode), so an empty agentic flag still

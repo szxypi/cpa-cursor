@@ -132,7 +132,14 @@ func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
 	}
 
 	models := filterByPolicy(append([]pluginapi.ModelInfo(nil), staticCursorModels...))
-	live := filterByPolicy(fetchLiveCatalog(identity))
+	account := fetchLiveCatalog(identity)
+	if len(account) > 0 {
+		// Families come from the whole account catalog so that the panel
+		// selection decides which families are listed, not which efforts a
+		// listed family can reach.
+		storeCursorFamilies(key, deriveCursorFamilies(account))
+	}
+	live := filterByPolicy(account)
 	if len(live) > 0 {
 		byID := map[string]pluginapi.ModelInfo{}
 		for _, m := range live {
@@ -156,6 +163,7 @@ func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
 		}
 	}
 	applyCursorModelTiers(models)
+	models = append(models, filterByPolicy(cursorFamilyInfos(cachedCursorFamilies(key)))...)
 
 	cursorCatalogMu.Lock()
 	cursorCatalogCache[key] = cursorCatalogEntry{models: models, at: time.Now()}
