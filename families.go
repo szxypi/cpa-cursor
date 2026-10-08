@@ -140,7 +140,9 @@ func (f cursorFamily) resolve(effort string) string {
 // efforts the family can select.
 func (f cursorFamily) modelInfo() pluginapi.ModelInfo {
 	levels := f.levels()
-	name := f.Base
+	// Base keeps the upstream id's own cursor- prefix, which the display
+	// already carries; strip it so the label is not "Cursor cursor-...".
+	name := strings.TrimPrefix(f.Base, cursorFamilyPrefix)
 	if f.Fast {
 		name += " fast"
 	}

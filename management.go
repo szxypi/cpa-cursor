@@ -64,6 +64,9 @@ func handleManagementRequest(request []byte) ([]byte, error) {
 			if err := resetPolicy(); err != nil {
 				return errorEnvelope("policy_reset_failed", err.Error()), nil
 			}
+			// The merged catalog was filtered by the previous selection; drop it
+			// so the host's re-pull sees the new one.
+			clearCursorCatalogCache()
 			rewritten := rewriteCursorAuths()
 			return jsonResponse(http.StatusOK, map[string]any{"status": "success", "reset": true, "refreshed": rewritten})
 		}
@@ -77,6 +80,7 @@ func handleManagementRequest(request []byte) ([]byte, error) {
 		if err := savePolicySelection(cleaned); err != nil {
 			return errorEnvelope("policy_save_failed", err.Error()), nil
 		}
+		clearCursorCatalogCache()
 		rewritten := rewriteCursorAuths()
 		return jsonResponse(http.StatusOK, map[string]any{"status": "success", "selected": len(cleaned), "refreshed": rewritten})
 	default:
@@ -337,11 +341,13 @@ func managementTest(authName, versionOverride, clientTypeOverride string) ([]byt
 	})
 }
 
-// rewriteCursorAuths rewrites every cursor credential file unchanged so the
-// host watcher reloads them and re-pulls model.for_auth — RegisterClient has
-// replace semantics, so the shrunken selection takes effect immediately.
-// host.auth.list hides file entries without a path attribute, so this walks
-// the auth directory directly (the plugin runs inside the service process).
+// rewriteCursorAuths stamps every cursor credential file with a fresh
+// revision so the host watcher reloads it and re-pulls model.for_auth —
+// RegisterClient has replace semantics, so the shrunken selection takes effect
+// immediately. The watcher skips byte-identical files, so the write must change
+// the content. host.auth.list hides file entries without a path attribute, so
+// this walks the auth directory directly (the plugin runs inside the service
+// process).
 func rewriteCursorAuths() int {
 	dir := filepath.Join(cwdOrRoot(), "auths")
 	matches, err := filepath.Glob(filepath.Join(dir, providerKey+"-*.json"))
@@ -349,6 +355,8 @@ func rewriteCursorAuths() int {
 		hostLog("warn", fmt.Sprintf("rewrite found no cursor auths in %s: %v", dir, err))
 		return 0
 	}
+	// Milliseconds stay exact through a float64 round trip of the JSON.
+	revision := time.Now().UnixMilli()
 	count := 0
 	for _, path := range matches {
 		raw, errRead := os.ReadFile(path)
@@ -359,7 +367,20 @@ func rewriteCursorAuths() int {
 		if _, err := parseCursorCredential(raw); err != nil {
 			continue
 		}
-		if err := os.WriteFile(path, raw, 0o600); err != nil {
+		// Decode into a generic map so unknown keys (ghost_mode aliases and
+		// whatever a future import adds) survive the round trip.
+		var fields map[string]any
+		if err := json.Unmarshal(raw, &fields); err != nil {
+			hostLog("warn", "rewrite decode failed "+path+": "+err.Error())
+			continue
+		}
+		fields["models_revision"] = revision
+		updated, errMarshal := json.MarshalIndent(fields, "", "  ")
+		if errMarshal != nil {
+			hostLog("warn", "rewrite encode failed "+path+": "+errMarshal.Error())
+			continue
+		}
+		if err := os.WriteFile(path, updated, 0o600); err != nil {
 			hostLog("warn", "rewrite write failed "+path+": "+err.Error())
 			continue
 		}

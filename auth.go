@@ -102,6 +102,9 @@ func (c *cursorCredential) metadata() map[string]any {
 	if c.GhostMode != nil {
 		meta["GhostMode"] = *c.GhostMode
 	}
+	if c.ModelsRevision != "" {
+		meta["ModelsRevision"] = c.ModelsRevision.String()
+	}
 	return meta
 }
 

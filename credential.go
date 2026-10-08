@@ -25,6 +25,10 @@ type cursorCredential struct {
 	Email       string `json:"email,omitempty"`
 	Label       string `json:"label,omitempty"`
 	GhostMode   *bool  `json:"ghost_mode,omitempty"`
+	// ModelsRevision is stamped by a panel save. The host compares the parsed
+	// auth, not the file, before it re-pulls the models, so the stamp must
+	// reach storageJSON and metadata.
+	ModelsRevision json.Number `json:"models_revision,omitempty"`
 }
 
 // newCursorCredential builds an imported credential; ghost mode defaults on
@@ -100,6 +104,9 @@ func (c *cursorCredential) storageJSON() []byte {
 	}
 	if c.GhostMode != nil {
 		storage["ghost_mode"] = *c.GhostMode
+	}
+	if c.ModelsRevision != "" {
+		storage["models_revision"] = c.ModelsRevision
 	}
 	raw, _ := json.Marshal(storage)
 	return raw

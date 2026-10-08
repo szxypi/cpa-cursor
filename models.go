@@ -80,9 +80,15 @@ var (
 type cursorCatalogEntry struct {
 	models []pluginapi.ModelInfo
 	at     time.Time
+	ttl    time.Duration
 }
 
 const cursorCatalogTTL = 10 * time.Minute
+
+// cursorCatalogFallbackTTL caches a result that has no live catalog behind it
+// (no fetch, no disk copy) only briefly, so a late-starting proxy is picked up
+// without waiting out the full TTL.
+const cursorCatalogFallbackTTL = time.Minute
 
 // cursorUsableModel is one entry of the GetUsableModels response.
 type cursorUsableModel struct {
@@ -121,19 +127,42 @@ func parseUsableModels(data []byte) []cursorUsableModel {
 	return out
 }
 
+// fetchLiveCatalogFn is the live catalog pull. It is a variable so tests can
+// replace the network call with a fixed account catalog.
+var fetchLiveCatalogFn = fetchLiveCatalog
+
+// clearCursorCatalogCache drops the merged catalogs so the next model pull
+// reflects a fresh panel selection. cursorFamilyCache stays: the executor
+// resolves the selected efforts from it, and the account catalog did not change.
+func clearCursorCatalogCache() {
+	cursorCatalogMu.Lock()
+	cursorCatalogCache = map[string]cursorCatalogEntry{}
+	cursorCatalogMu.Unlock()
+}
+
 // catalogForToken merges the account's live catalog over the static list.
 func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
 	key := cleanToken(identity.AccessToken)
 	cursorCatalogMu.Lock()
 	entry, cached := cursorCatalogCache[key]
 	cursorCatalogMu.Unlock()
-	if cached && time.Since(entry.at) < cursorCatalogTTL {
+	if cached && time.Since(entry.at) < entry.ttl {
 		return entry.models
 	}
 
 	models := filterByPolicy(append([]pluginapi.ModelInfo(nil), staticCursorModels...))
-	account := fetchLiveCatalog(identity)
+	ttl := cursorCatalogFallbackTTL
+	account := fetchLiveCatalogFn(identity)
 	if len(account) > 0 {
+		saveCursorCatalogDisk(key, account)
+	} else if disk := loadCursorCatalogDisk(key); len(disk) > 0 {
+		// A cold start behind a dead proxy has no live pull but the last
+		// successful one is on disk, families included.
+		hostLog("info", "cursor live catalog unavailable, using the catalog saved on disk")
+		account = disk
+	}
+	if len(account) > 0 {
+		ttl = cursorCatalogTTL
 		// Families come from the whole account catalog so that the panel
 		// selection decides which families are listed, not which efforts a
 		// listed family can reach.
@@ -146,12 +175,17 @@ func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
 			byID[m.ID] = m
 		}
 		// static first (stable order, carries tier metadata), then anything
-		// the account exposes that the static list missed.
+		// the account exposes that the static list missed. Every live id
+		// leaves byID, so an id both lists carry appears once.
 		for i := range models {
-			if live, ok := byID[models[i].ID]; ok && live.Description != "" {
-				models[i].Description = live.Description
-				delete(byID, models[i].ID)
+			liveModel, ok := byID[models[i].ID]
+			if !ok {
+				continue
 			}
+			if liveModel.Description != "" {
+				models[i].Description = liveModel.Description
+			}
+			delete(byID, models[i].ID)
 		}
 		ids := make([]string, 0, len(byID))
 		for id := range byID {
@@ -166,7 +200,7 @@ func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
 	models = append(models, filterByPolicy(cursorFamilyInfos(cachedCursorFamilies(key)))...)
 
 	cursorCatalogMu.Lock()
-	cursorCatalogCache[key] = cursorCatalogEntry{models: models, at: time.Now()}
+	cursorCatalogCache[key] = cursorCatalogEntry{models: models, at: time.Now(), ttl: ttl}
 	cursorCatalogMu.Unlock()
 	return models
 }

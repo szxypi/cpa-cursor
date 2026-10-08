@@ -64,6 +64,15 @@ machineId 省略时由 token 派生（`sha256(token+"machineId")`，与 9router 
 
 导入后模型即出现在 `/v1/models`（账号有权限的为准），用法与其它提供方一致：`model: cursor/claude-4.5-sonnet` 之类。
 
+## v0.3.35 选择生效、重复模型 ID 与族显示名
+
+- **重复模型 ID**：live 目录与静态列表都有的 ID 只注册一次。此前只在 live 条目的 `Description` 非空时才把它从「待追加」集合里删掉，而 `GetUsableModels` 从不返回 Description，所以去重从不执行，同一 ID 出现两次。
+- **面板保存不生效**（三个原因一起修）：
+  1. 改写凭证文件时写入 `models_revision` 字段（毫秒时间戳）。宿主有两道检查：watcher 按 sha256 比较文件内容，然后用 `authEqual` 比较 `auth.parse` 的结果。任一相同，宿主就不再调 `model.for_auth`。此前原样写回相同字节，两道检查都挡住了它，选择只在重启后生效。现在 `auth.parse` 把 `models_revision` 放进 `StorageJSON` 和 `Metadata`，两道检查都能通过。其余字段（含 `GhostMode` 与 `ghost_mode`）原样保留，权限仍为 0600，`auth.parse` 仍能解析出相同 token。
+  2. 保存选择与恢复全部时清空合并目录缓存。该缓存是过滤后的结果（TTL 10 分钟），10 分钟内改了选择，宿主重新拉取也只拿到旧结果。族缓存（executor 解析档位用）不动。
+  3. live 拉取成功时把账号目录（ID、Name、DisplayName）落盘到 `cpa-cursor/catalog/<sha256(token) 的 hex>.json`（目录 0700、文件 0600，文件名不含 token）。live 失败时读回它并按 live 成功处理：照常生成族模型与合并。live 失败且无磁盘目录时结果只缓存 1 分钟，不再缓存 10 分钟——冷启动代理未就绪时不必等满 10 分钟才恢复。
+- **族显示名双前缀**：上游 ID 自带 `cursor-` 前缀时（如 `cursor-grok-4.6-high`），此前显示为 `Cursor cursor-grok-4.6 (effort family)`；现在拼显示名时去掉该前缀。族 ID 不变。
+
 ## v0.3.34 思考档位族模型
 
 - **问题**：AgentService 的 run 请求只带模型 ID，不带思考档位。Cursor 为每个档位提供单独的 ID（如 `grok-4.7-low-fast` … `grok-4.7-xhigh-fast`）。插件以前只在已停用的 ChatService 路径里映射 medium/high，所以客户端发的 `reasoning_effort` 全部被忽略。
