@@ -16,12 +16,14 @@ import (
 
 // Resource paths exposed under /v0/resource/plugins/cpa-cursor/*.
 const (
-	panelPath     = "/panel"
-	accountsPath  = "/accounts"
-	importPath    = "/import"
-	modelsPath    = "/models"
-	modelsSetPath = "/models/set"
-	testPath      = "/test"
+	panelPath      = "/panel"
+	accountsPath   = "/accounts"
+	importPath     = "/import"
+	modelsPath     = "/models"
+	modelsSetPath  = "/models/set"
+	aliasesPath    = "/aliases"
+	aliasesSetPath = "/aliases/set"
+	testPath       = "/test"
 )
 
 func handleManagementRegister() ([]byte, error) {
@@ -34,6 +36,8 @@ func handleManagementRegister() ([]byte, error) {
 			{Path: importPath, Description: "导入 Cursor access token 并保存凭证文件"},
 			{Path: modelsPath, Description: "查询指定 Cursor 账号的可用模型列表"},
 			{Path: modelsSetPath, Description: "设置选中的模型集合（ids=逗号分隔；reset=1 恢复全部启用）"},
+			{Path: aliasesPath, Description: "查询模型别名配置与可作为原模型的 ID 列表"},
+			{Path: aliasesSetPath, Description: "保存模型别名（data=URL 编码的 JSON 数组，元素含 name/alias/fork）"},
 			{Path: testPath, Description: "对 Cursor 上游进行连通性测试"},
 		},
 	})
@@ -83,6 +87,11 @@ func handleManagementRequest(request []byte) ([]byte, error) {
 		clearCursorCatalogCache()
 		rewritten := rewriteCursorAuths()
 		return jsonResponse(http.StatusOK, map[string]any{"status": "success", "selected": len(cleaned), "refreshed": rewritten})
+
+	case strings.HasSuffix(req.Path, aliasesSetPath):
+		return managementAliasSet(req.Query.Get("data"))
+	case strings.HasSuffix(req.Path, aliasesPath):
+		return managementAliases()
 	default:
 		return jsonResponse(http.StatusNotFound, map[string]any{"error": "unknown resource path"})
 	}

@@ -149,6 +149,49 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .models-table th { color: var(--text-tertiary); font-weight: 500; font-size: 12.5px; }
 .models-table td.mono { font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; }
 
+.card-head { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; flex-wrap: wrap; margin-bottom: 12px; }
+.card-head h2 { margin-bottom: 2px; }
+.card-sub { margin: 0; font-size: 13px; color: var(--text-secondary); max-width: 52ch; }
+
+.alias-hint { display: flex; align-items: flex-start; gap: 8px; margin: 0 0 14px; padding: 8px 12px; border-radius: 6px; background: var(--bg-tertiary); color: var(--text-secondary); font-size: 12.5px; }
+.alias-hint svg { flex-shrink: 0; margin-top: 4px; color: var(--text-tertiary); }
+
+.alias-row { display: flex; align-items: flex-end; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--border-color); }
+.alias-index { flex-shrink: 0; padding-bottom: 9px; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 12.5px; color: var(--text-tertiary); }
+.alias-field { display: flex; flex-direction: column; flex: 1 1 140px; min-width: 0; }
+.alias-field-name { flex: 1.4 1 170px; }
+.alias-field > label { margin: 0 0 4px; }
+.alias-arrow { flex-shrink: 0; padding-bottom: 9px; color: var(--text-tertiary); }
+.alias-keep { display: flex; flex-direction: column; flex-shrink: 0; }
+.alias-keep > label { margin: 0 0 6px; }
+.icon-btn { width: 34px; height: 34px; padding: 0; display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; color: var(--text-secondary); }
+.icon-btn:hover { color: var(--warning-text); border-color: var(--warning-border); }
+
+.switch { position: relative; display: inline-block; width: 34px; height: 20px; flex-shrink: 0; }
+.switch input { position: absolute; top: 0; left: 0; width: 100%; height: 100%; margin: 0; padding: 0; border: none; border-radius: 999px; background: transparent; opacity: 0; cursor: pointer; }
+.switch-track { position: absolute; top: 0; left: 0; width: 100%; height: 100%; border-radius: 999px; background: var(--bg-tertiary); border: 1px solid var(--border-primary); pointer-events: none; transition: background .15s var(--ease-out-strong), border-color .15s var(--ease-out-strong); }
+.switch-track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--primary-contrast); transition: transform .15s var(--ease-out-strong); }
+.switch input:checked + .switch-track { background: var(--primary-color); border-color: var(--primary-color); }
+.switch input:checked + .switch-track::after { transform: translateX(14px); }
+.switch input:focus-visible + .switch-track { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+
+#aliases-card button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+.alias-row input:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 2px; }
+.alias-row input[aria-invalid="true"] { border-color: var(--warning-color); }
+
+.alias-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 14px; }
+.alias-actions .status { margin-top: 0; }
+
+@media (max-width: 639px) {
+  .alias-row { flex-wrap: wrap; align-items: flex-start; row-gap: 4px; }
+  .alias-arrow { display: none; }
+  .alias-index { order: 1; padding-bottom: 0; }
+  .alias-keep { order: 2; flex: 1 1 auto; }
+  .alias-keep > label { margin-bottom: 2px; }
+  .alias-row .icon-btn { order: 3; }
+  .alias-field { order: 4; flex: 1 1 100%; }
+}
+
 .empty { color: var(--text-tertiary); padding: 18px 0; text-align: center; }
 
 .skeleton { display: flex; flex-direction: column; gap: 8px; padding: 4px 0; }
@@ -188,6 +231,32 @@ details.raw pre { overflow: auto; font-size: 12px; background: var(--bg-primary)
     <h2>已导入账号</h2>
     <div id="accounts" class="skeleton"><span></span><span></span><span></span></div>
     <div class="actions"><button type="button" id="refresh">刷新</button></div>
+  </section>
+
+  <section class="card" id="aliases-card">
+    <div class="card-head">
+      <div>
+        <h2>模型别名</h2>
+        <p class="card-sub">选择原模型，并填写客户端使用的别名。</p>
+      </div>
+      <button type="button" id="alias-add">+ 添加别名</button>
+    </div>
+    <p class="alias-hint">
+      <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true">
+        <circle cx="8" cy="8" r="6.75" fill="none" stroke="currentColor" stroke-width="1.5"></circle>
+        <path d="M8 7.2v4" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"></path>
+        <circle cx="8" cy="4.9" r="0.95" fill="currentColor"></circle>
+      </svg>
+      <span id="alias-hint-text"></span>
+    </p>
+    <div class="empty" id="alias-load-error" hidden></div>
+    <div id="alias-rows"></div>
+    <div class="empty" id="alias-empty" hidden>还没有别名。点“添加别名”新增一行。</div>
+    <datalist id="alias-models"></datalist>
+    <div class="alias-actions">
+      <button type="button" class="primary" id="alias-save" disabled>保存别名</button>
+      <span class="status" id="alias-status" aria-live="polite"></span>
+    </div>
   </section>
 
   <section class="card" id="models-card" hidden>
@@ -235,6 +304,295 @@ details.raw pre { overflow: auto; font-size: 12px; background: var(--bg-primary)
   function getJSON(path) {
     return fetch(base + path).then(function (r) { return r.json(); });
   }
+
+  // ---- aliases --------------------------------------------------------
+
+  var aliasDirty = false;
+  var aliasSaving = false;
+  var aliasLoading = false;
+
+  function trashIcon() {
+    var NS = "http://www.w3.org/2000/svg";
+    var svg = document.createElementNS(NS, "svg");
+    svg.setAttribute("viewBox", "0 0 16 16");
+    svg.setAttribute("width", "15");
+    svg.setAttribute("height", "15");
+    svg.setAttribute("aria-hidden", "true");
+    var p1 = document.createElementNS(NS, "path");
+    p1.setAttribute("d", "M2.5 4h11M6.5 4V2.6h3V4M4.3 4l.6 9h6.2l.6-9");
+    p1.setAttribute("fill", "none");
+    p1.setAttribute("stroke", "currentColor");
+    p1.setAttribute("stroke-width", "1.4");
+    p1.setAttribute("stroke-linecap", "round");
+    p1.setAttribute("stroke-linejoin", "round");
+    var p2 = document.createElementNS(NS, "path");
+    p2.setAttribute("d", "M6.6 6.8v3.6M9.4 6.8v3.6");
+    p2.setAttribute("fill", "none");
+    p2.setAttribute("stroke", "currentColor");
+    p2.setAttribute("stroke-width", "1.4");
+    p2.setAttribute("stroke-linecap", "round");
+    svg.appendChild(p1);
+    svg.appendChild(p2);
+    return svg;
+  }
+
+  function markAliasDirty() {
+    aliasDirty = true;
+    updateAliasStatus();
+  }
+
+  function updateAliasStatus() {
+    var btn = document.getElementById("alias-save");
+    var errEl = document.getElementById("alias-load-error");
+    if (errEl && !errEl.hidden) {
+      btn.disabled = true;
+      setStatus("alias-status", "");
+      return;
+    }
+    if (aliasSaving || aliasLoading) { btn.disabled = true; return; }
+    btn.disabled = !aliasDirty;
+    if (aliasDirty) {
+      var st = document.getElementById("alias-status");
+      if (!st.classList.contains("err")) setStatus("alias-status", "有未保存的修改");
+    }
+  }
+
+  function updateAliasEmpty() {
+    var rows = document.getElementById("alias-rows");
+    var errEl = document.getElementById("alias-load-error");
+    document.getElementById("alias-empty").hidden =
+      rows.children.length > 0 || (errEl && !errEl.hidden);
+  }
+
+  function renumberAliases() {
+    var rows = document.querySelectorAll("#alias-rows .alias-row");
+    Array.prototype.forEach.call(rows, function (row, i) {
+      row.querySelector(".alias-index").textContent = (i + 1 < 10 ? "0" : "") + (i + 1);
+      var btn = row.querySelector(".icon-btn");
+      if (btn) btn.setAttribute("aria-label", "删除第 " + (i + 1) + " 行");
+    });
+    updateAliasEmpty();
+  }
+
+  function fieldLabel(text, input) {
+    var label = document.createElement("label");
+    label.textContent = text;
+    var suffix = "-a" + Math.random().toString(36).slice(2, 8);
+    input.id = input.id + suffix;
+    label.setAttribute("for", input.id);
+    return label;
+  }
+
+  function addAliasRow(entry, focus) {
+    var row = document.createElement("div");
+    row.className = "alias-row";
+
+    var index = document.createElement("span");
+    index.className = "alias-index";
+    row.appendChild(index);
+
+    var nameWrap = document.createElement("div");
+    nameWrap.className = "alias-field alias-field-name";
+    var nameInput = document.createElement("input");
+    nameInput.className = "alias-name";
+    nameInput.setAttribute("list", "alias-models");
+    nameInput.setAttribute("autocomplete", "off");
+    nameInput.setAttribute("spellcheck", "false");
+    nameInput.value = (entry && entry.name) || "";
+    nameWrap.appendChild(fieldLabel("原模型名称", nameInput));
+    nameWrap.appendChild(nameInput);
+    row.appendChild(nameWrap);
+
+    var arrow = document.createElement("span");
+    arrow.className = "alias-arrow";
+    arrow.setAttribute("aria-hidden", "true");
+    arrow.textContent = "→";
+    row.appendChild(arrow);
+
+    var aliasWrap = document.createElement("div");
+    aliasWrap.className = "alias-field";
+    var aliasInput = document.createElement("input");
+    aliasInput.className = "alias-alias";
+    aliasInput.setAttribute("autocomplete", "off");
+    aliasInput.setAttribute("spellcheck", "false");
+    aliasInput.value = (entry && entry.alias) || "";
+    aliasWrap.appendChild(fieldLabel("别名（必填）", aliasInput));
+    aliasWrap.appendChild(aliasInput);
+    row.appendChild(aliasWrap);
+
+    var keepWrap = document.createElement("div");
+    keepWrap.className = "alias-keep";
+    var keepInput = document.createElement("input");
+    keepInput.type = "checkbox";
+    keepInput.className = "alias-fork";
+    keepInput.setAttribute("role", "switch");
+    keepInput.checked = !entry || entry.fork !== false;
+    var keepLabel = fieldLabel("保留原名", keepInput);
+    var switchEl = document.createElement("span");
+    switchEl.className = "switch";
+    var track = document.createElement("span");
+    track.className = "switch-track";
+    track.setAttribute("aria-hidden", "true");
+    switchEl.appendChild(keepInput);
+    switchEl.appendChild(track);
+    keepWrap.appendChild(keepLabel);
+    keepWrap.appendChild(switchEl);
+    row.appendChild(keepWrap);
+
+    var delBtn = document.createElement("button");
+    delBtn.type = "button";
+    delBtn.className = "icon-btn";
+    delBtn.appendChild(trashIcon());
+    delBtn.addEventListener("click", function () {
+      row.remove();
+      renumberAliases();
+      markAliasDirty();
+    });
+    row.appendChild(delBtn);
+
+    nameInput.addEventListener("input", function () {
+      nameInput.removeAttribute("aria-invalid");
+      markAliasDirty();
+    });
+    aliasInput.addEventListener("input", function () {
+      aliasInput.removeAttribute("aria-invalid");
+      markAliasDirty();
+    });
+    keepInput.addEventListener("change", markAliasDirty);
+
+    document.getElementById("alias-rows").appendChild(row);
+    renumberAliases();
+    if (focus) nameInput.focus();
+  }
+
+  function aliasHintText(count) {
+    var prefix = typeof count === "number"
+      ? "已加载 " + count + " 个模型，可在“原模型名称”中下拉选择，也可手动输入。"
+      : "可在“原模型名称”中下拉选择已加载的模型，也可手动输入。";
+    return prefix + "开启“保留原名”时原模型名和别名都可用，关闭时只保留别名。别名与其他渠道的模型同名时会合并进同一候选池。";
+  }
+
+  function clearAliasInvalid() {
+    Array.prototype.forEach.call(
+      document.querySelectorAll("#alias-rows input[aria-invalid]"),
+      function (input) { input.removeAttribute("aria-invalid"); }
+    );
+  }
+
+  function markAliasLineError(text) {
+    var m = /第\s*(\d+)\s*行/.exec(text || "");
+    if (!m) return;
+    var n = parseInt(m[1], 10);
+    var rows = document.querySelectorAll("#alias-rows .alias-row");
+    if (n < 1 || n > rows.length) return;
+    Array.prototype.forEach.call(rows[n - 1].querySelectorAll("input"), function (input) {
+      input.setAttribute("aria-invalid", "true");
+    });
+  }
+
+  function collectAliasRows() {
+    var rows = [];
+    var error = "";
+    Array.prototype.forEach.call(document.querySelectorAll("#alias-rows .alias-row"), function (row, i) {
+      var name = row.querySelector(".alias-name").value.trim();
+      var alias = row.querySelector(".alias-alias").value.trim();
+      var fork = row.querySelector(".alias-fork").checked;
+      if (name && !alias && !error) {
+        error = "第 " + (i + 1) + " 行：别名必填";
+        row.querySelector(".alias-alias").setAttribute("aria-invalid", "true");
+      }
+      // Submit every DOM row, blanks included: the server reports error
+      // line numbers as the 1-based index in this array, so it must match
+      // the row numbering the user sees.
+      rows.push({ name: name, alias: alias, fork: fork });
+    });
+    return { rows: rows, error: error };
+  }
+
+  function saveAliases() {
+    clearAliasInvalid();
+    var collected = collectAliasRows();
+    if (collected.error) {
+      setStatus("alias-status", collected.error, "err");
+      return;
+    }
+    var btn = document.getElementById("alias-save");
+    aliasSaving = true;
+    btn.disabled = true;
+    setStatus("alias-status", "保存中…");
+    getJSON("/aliases/set?data=" + encodeURIComponent(JSON.stringify(collected.rows))).then(function (resp) {
+      if (resp && resp.status === "success") {
+        aliasDirty = false;
+        setStatus("alias-status", "");
+        toast("已保存 " + resp.count + " 条别名，/v1/models 已刷新");
+        loadAliases();
+      } else {
+        var message = (resp && resp.error) || "保存失败";
+        setStatus("alias-status", message, "err");
+        markAliasLineError(message);
+      }
+    }).catch(function () {
+      setStatus("alias-status", "保存失败", "err");
+    }).finally(function () {
+      aliasSaving = false;
+      updateAliasStatus();
+    });
+  }
+
+  function loadAliases() {
+    var addBtn = document.getElementById("alias-add");
+    var host = document.getElementById("alias-rows");
+    aliasLoading = true;
+    addBtn.disabled = true;
+    if (!aliasDirty) {
+      host.innerHTML = '<div class="skeleton"><span></span><span></span><span></span></div>';
+      updateAliasEmpty();
+    }
+    updateAliasStatus();
+    getJSON("/aliases").then(function (resp) {
+      document.getElementById("alias-load-error").hidden = true;
+      var list = (resp && resp.aliases) || [];
+      var models = (resp && resp.models) || [];
+      var datalist = document.getElementById("alias-models");
+      datalist.textContent = "";
+      models.forEach(function (id) {
+        var opt = document.createElement("option");
+        opt.value = id;
+        datalist.appendChild(opt);
+      });
+      document.getElementById("alias-hint-text").textContent = aliasHintText(models.length);
+      if (aliasDirty) {
+        // Keep the user's unsaved rows; only the datalist and the hint
+        // text refresh. Rebuilding here would drop their edits.
+        return;
+      }
+      host.textContent = "";
+      list.forEach(function (entry) { addAliasRow(entry, false); });
+      updateAliasEmpty();
+      aliasDirty = false;
+      setStatus("alias-status", "");
+      updateAliasStatus();
+    }).catch(function (err) {
+      if (!aliasDirty) {
+        host.textContent = "";
+      }
+      var errEl = document.getElementById("alias-load-error");
+      errEl.textContent = "加载失败：" + String(err);
+      errEl.hidden = false;
+      updateAliasEmpty();
+      updateAliasStatus();
+    }).finally(function () {
+      aliasLoading = false;
+      addBtn.disabled = false;
+      updateAliasStatus();
+    });
+  }
+
+  document.getElementById("alias-add").addEventListener("click", function () {
+    addAliasRow(null, true);
+    markAliasDirty();
+  });
+  document.getElementById("alias-save").addEventListener("click", saveAliases);
 
   // ---- import ---------------------------------------------------------
 
@@ -423,6 +781,7 @@ details.raw pre { overflow: auto; font-size: 12px; background: var(--bg-primary)
   document.getElementById("refresh").addEventListener("click", loadAccounts);
 
   loadAccounts();
+  loadAliases();
 })();
 </script>
 </body>

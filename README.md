@@ -64,6 +64,20 @@ machineId 省略时由 token 派生（`sha256(token+"machineId")`，与 9router 
 
 导入后模型即出现在 `/v1/models`（账号有权限的为准），用法与其它提供方一致：`model: cursor/claude-4.5-sonnet` 之类。
 
+## 模型别名
+
+模型别名给一个原模型 ID 起一个客户端使用的名字。配置保存在服务工作目录的 `cursor-aliases.yaml`（权限 0600）。文件不存在表示没有别名。面板保存后立即生效，无需重启。
+
+- `name`：原模型 ID。可以填账号目录里的 ID，也可以填族 ID（如 `cursor-grok-4.7-fast`）。
+- `alias`：客户端使用的名字。插件在处理请求开始时把别名换回原模型 ID。别名指向族 ID 时，仍按 `reasoning_effort` 选变体。
+- `fork: true`：原名和别名都注册。
+- `fork: false`：只注册别名，隐藏原名。
+- 别名独立于模型选择。原模型没有被面板选中时，别名照样注册。
+- 别名与已有模型 ID 不区分大小写地相同时，保存返回 400。
+- 匹配不区分大小写。插件把别名换回目录里的真实 ID，再发给上游。
+
+不使用宿主的 `oauth-model-alias`，原因有两个。宿主插件 ABI 没有 `config.yaml` 的读写回调。宿主在执行器之前还原别名，这会绕过本插件族模型按 `reasoning_effort` 选变体的逻辑。
+
 ## v0.3.35 选择生效、重复模型 ID 与族显示名
 
 - **重复模型 ID**：live 目录与静态列表都有的 ID 只注册一次。此前只在 live 条目的 `Description` 非空时才把它从「待追加」集合里删掉，而 `GetUsableModels` 从不返回 Description，所以去重从不执行，同一 ID 出现两次。

@@ -62,6 +62,11 @@ func prepareChat(req rpcExecutorRequest) (*preparedChat, *statusError) {
 	if model == "" {
 		return nil, newStatusError(http.StatusBadRequest, "invalid_request", "cursor request carries no model")
 	}
+	// A configured alias maps back to its original id before the effort
+	// resolver runs, so an alias on a family id still picks the variant. The
+	// account identity lets the resolver tell a real model id from an alias
+	// spelled like it.
+	model = resolveCursorAlias(cred.identity(), model)
 	// The AgentService run request selects effort only through the model id,
 	// so a family id becomes the variant for the requested effort.
 	model = resolveCursorModel(cred.identity(), model, parsed.ReasoningEffort)

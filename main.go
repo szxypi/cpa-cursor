@@ -11,7 +11,7 @@ import (
 
 const (
 	pluginName    = "cpa-cursor"
-	pluginVersion = "0.3.35"
+	pluginVersion = "0.3.36"
 	providerKey   = "cursor"
 	logPrefix     = "[cpa-cursor] "
 )

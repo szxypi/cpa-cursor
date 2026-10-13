@@ -140,38 +140,38 @@ func clearCursorCatalogCache() {
 	cursorCatalogMu.Unlock()
 }
 
-// catalogForToken merges the account's live catalog over the static list.
-func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
-	key := cleanToken(identity.AccessToken)
-	cursorCatalogMu.Lock()
-	entry, cached := cursorCatalogCache[key]
-	cursorCatalogMu.Unlock()
-	if cached && time.Since(entry.at) < entry.ttl {
-		return entry.models
-	}
-
-	models := filterByPolicy(append([]pluginapi.ModelInfo(nil), staticCursorModels...))
-	ttl := cursorCatalogFallbackTTL
+// accountCatalog fetches the account's live catalog, falling back to the
+// last one saved on disk; nil means neither source has one (the static list
+// applies).
+func accountCatalog(identity cursorIdentity, key string) []pluginapi.ModelInfo {
 	account := fetchLiveCatalogFn(identity)
 	if len(account) > 0 {
 		saveCursorCatalogDisk(key, account)
-	} else if disk := loadCursorCatalogDisk(key); len(disk) > 0 {
+		return account
+	}
+	if disk := loadCursorCatalogDisk(key); len(disk) > 0 {
 		// A cold start behind a dead proxy has no live pull but the last
 		// successful one is on disk, families included.
 		hostLog("info", "cursor live catalog unavailable, using the catalog saved on disk")
-		account = disk
+		return disk
 	}
+	return nil
+}
+
+// buildCursorCatalog merges the account catalog over the static list and adds
+// the account's effort families. The result is unfiltered: the policy filter
+// and the alias overlay apply to it afterwards.
+func buildCursorCatalog(key string, account []pluginapi.ModelInfo) []pluginapi.ModelInfo {
 	if len(account) > 0 {
-		ttl = cursorCatalogTTL
 		// Families come from the whole account catalog so that the panel
 		// selection decides which families are listed, not which efforts a
 		// listed family can reach.
 		storeCursorFamilies(key, deriveCursorFamilies(account))
 	}
-	live := filterByPolicy(account)
-	if len(live) > 0 {
+	models := append([]pluginapi.ModelInfo(nil), staticCursorModels...)
+	if len(account) > 0 {
 		byID := map[string]pluginapi.ModelInfo{}
-		for _, m := range live {
+		for _, m := range account {
 			byID[m.ID] = m
 		}
 		// static first (stable order, carries tier metadata), then anything
@@ -197,7 +197,27 @@ func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
 		}
 	}
 	applyCursorModelTiers(models)
-	models = append(models, filterByPolicy(cursorFamilyInfos(cachedCursorFamilies(key)))...)
+	return append(models, cursorFamilyInfos(cachedCursorFamilies(key))...)
+}
+
+// catalogForToken merges the account's live catalog over the static list,
+// then applies the panel selection and the configured aliases.
+func catalogForToken(identity cursorIdentity) []pluginapi.ModelInfo {
+	key := cleanToken(identity.AccessToken)
+	cursorCatalogMu.Lock()
+	entry, cached := cursorCatalogCache[key]
+	cursorCatalogMu.Unlock()
+	if cached && time.Since(entry.at) < entry.ttl {
+		return entry.models
+	}
+
+	account := accountCatalog(identity, key)
+	ttl := cursorCatalogFallbackTTL
+	if len(account) > 0 {
+		ttl = cursorCatalogTTL
+	}
+	source := buildCursorCatalog(key, account)
+	models := appendCursorAliases(filterByPolicy(source), source)
 
 	cursorCatalogMu.Lock()
 	cursorCatalogCache[key] = cursorCatalogEntry{models: models, at: time.Now(), ttl: ttl}
